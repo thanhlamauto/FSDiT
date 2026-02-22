@@ -12,7 +12,7 @@ nonpytree_field = functools.partial(flax.struct.field, pytree_node=False)
 
 def target_update(model, target, tau):
     """EMA update: new_target = tau * model + (1 - tau) * target."""
-    new_params = jax.tree_map(
+    new_params = jax.tree.map(
         lambda p, tp: p * tau + tp * (1 - tau), model.params, target.params
     )
     return target.replace(params=new_params)
