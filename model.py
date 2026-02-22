@@ -154,7 +154,7 @@ class PatchEmbed(nn.Module):
 
 
 class DiTBlock(nn.Module):
-    """adaLN-Zero DiT block. Optionally returns attention weights."""
+    """adaLN-Zero DiT block. Always uses manual QKV attention (single param set)."""
     hidden_size: int
     num_heads: int
     mlp_ratio: float = 4.0
@@ -167,18 +167,17 @@ class DiTBlock(nn.Module):
         )(nn.silu(c))
         shift_a, scale_a, gate_a, shift_m, scale_m, gate_m = jnp.split(c_proj, 6, axis=-1)
 
-        # ── Self-Attention ──
+        # ── Self-Attention (always same params, optionally returns weights) ──
         x_norm = modulate(
             nn.LayerNorm(use_bias=False, use_scale=False)(x), shift_a, scale_a
         )
-        if return_attn:
-            attn_out, attn_w = self._attention_with_weights(x_norm)
-        else:
-            attn_out = nn.MultiHeadDotProductAttention(
-                num_heads=self.num_heads,
-                kernel_init=nn.initializers.xavier_uniform(),
-            )(x_norm, x_norm)
-            attn_w = None
+        hd = self.hidden_size // self.num_heads
+        qkv = nn.Dense(3 * self.hidden_size, kernel_init=nn.initializers.xavier_uniform())(x_norm)
+        q, k, v = [rearrange(t, 'b n (h d) -> b h n d', h=self.num_heads)
+                    for t in jnp.split(qkv, 3, axis=-1)]
+        attn_w = jax.nn.softmax(jnp.einsum('bhqd,bhkd->bhqk', q, k) * (hd ** -0.5), axis=-1)
+        attn_out = rearrange(jnp.einsum('bhqk,bhkd->bhqd', attn_w, v), 'b h n d -> b n (h d)')
+        attn_out = nn.Dense(self.hidden_size, kernel_init=nn.initializers.xavier_uniform())(attn_out)
         x = x + gate_a[:, None] * attn_out
 
         # ── MLP ──
@@ -192,17 +191,6 @@ class DiTBlock(nn.Module):
         x = x + gate_m[:, None] * h
 
         return (x, attn_w) if return_attn else x
-
-    def _attention_with_weights(self, x):
-        """Manual MHA that returns attention weights for entropy tracking."""
-        hd = self.hidden_size // self.num_heads
-        qkv = nn.Dense(3 * self.hidden_size, kernel_init=nn.initializers.xavier_uniform())(x)
-        q, k, v = [rearrange(t, 'b n (h d) -> b h n d', h=self.num_heads)
-                    for t in jnp.split(qkv, 3, axis=-1)]
-        attn_w = jax.nn.softmax(jnp.einsum('bhqd,bhkd->bhqk', q, k) * (hd ** -0.5), axis=-1)
-        out = rearrange(jnp.einsum('bhqk,bhkd->bhqd', attn_w, v), 'b h n d -> b n (h d)')
-        out = nn.Dense(self.hidden_size, kernel_init=nn.initializers.xavier_uniform())(out)
-        return out, attn_w  # attn_w: (B, H, Q, K)
 
 
 class FinalLayer(nn.Module):
