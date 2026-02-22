@@ -29,15 +29,20 @@ FSDiT/
 ## Quick Start (Kaggle TPU v5e-8)
 
 ```python
-# In Kaggle notebook cell:
+# Cell 1: Clone & install
 !git clone https://github.com/thanhlamauto/FSDiT.git /kaggle/working/FSDiT
 !pip install -q wandb einops flax optax ml_collections jaxtyping typeguard diffusers
 
-import os
-os.chdir('/kaggle/working/FSDiT')
+# Cell 2: Split data (miniImageNet is flat — need train/val/test split)
+import os; os.chdir('/kaggle/working/FSDiT')
+!python prepare_data.py \
+    --src /kaggle/input/datasets/arjunashok33/miniimagenet \
+    --dst /kaggle/working/miniimagenet \
+    --train 60 --val 16 --test 20
 
+# Cell 3: Train
 !python train.py \
-    --data_dir /kaggle/input/datasets/arjunashok33/miniimagenet \
+    --data_dir /kaggle/working/miniimagenet \
     --save_dir /kaggle/working/ckpts \
     --batch_size 128 \
     --max_steps 200000 \
