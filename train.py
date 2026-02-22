@@ -60,7 +60,7 @@ flags.DEFINE_integer('num_sets', 100, 'Sets per class (each set = 6 images).')
 flags.DEFINE_integer('debug_overfit', 0, 'Overfit on N samples (0 = off).')
 # Logging
 flags.DEFINE_integer('log_interval', 500, 'Train metric logging interval.')
-flags.DEFINE_integer('eval_interval', 5000, 'Validation + attention entropy interval.')
+flags.DEFINE_integer('eval_interval', 5000, 'Validation + sample grid interval.')
 flags.DEFINE_integer('fid_interval', 25000, 'FID / sample grid interval.')
 flags.DEFINE_integer('save_interval', 25000, 'Checkpoint interval.')
 
@@ -121,9 +121,7 @@ def flow_velocity(x1, eps):
     """Ground-truth velocity: v = x1 - eps."""
     return x1 - eps
 
-def attention_entropy(attn_weights):
-    """Per-head entropy of attention. attn_weights: (B,H,Q,K) → (H,)"""
-    return -jnp.sum(attn_weights * jnp.log(attn_weights + 1e-8), axis=-1).mean(axis=(0, 2))
+
 
 def compute_t_bin_losses(loss_per_sample, t, num_bins):
     """Break down MSE loss by timestep bins. Returns (num_bins,) array."""
@@ -219,22 +217,7 @@ class Trainer(flax.struct.PyTreeNode):
         tbin = compute_t_bin_losses(mse, t, self.config['num_t_bins'])
         return loss, tbin
 
-    # ── Attention entropy ──────────────────────────────────────────────────
-    @partial(jax.pmap, axis_name='data')
-    def get_attn_entropy(self, images, support_embed):
-        """Returns (depth, num_heads) entropy matrix and (B,) timesteps."""
-        time_key, noise_key = jax.random.split(self.rng, 2)
-        if self.config['t_sampler'] == 'log-normal':
-            t = jax.nn.sigmoid(jax.random.normal(time_key, (images.shape[0],)))
-        else:
-            t = jax.random.uniform(time_key, (images.shape[0],))
-        eps = jax.random.normal(noise_key, images.shape)
-        x_t = flow_interpolate(images, eps, t[:, None, None, None])
 
-        _, attn_list = self.model_ema(
-            x_t, t, support_embed, train=False, force_drop_ids=False, return_attn=True)
-        entropies = jnp.stack([attention_entropy(aw) for aw in attn_list])  # (depth, H)
-        return entropies, t
 
     # ── CFG sampling ───────────────────────────────────────────────────────
     @partial(jax.pmap, axis_name='data',
@@ -380,20 +363,8 @@ def main(_):
                 log[f'val/loss_tbin_{b}'] = float(v_tbin_f[b])
             wandb.log(log, step=step)
 
-        # Attention entropy
-        try:
-            ent_matrix, _ = trainer.get_attn_entropy(val_img, val_sup)
-            ent = np.array(ent_matrix).mean(axis=0)  # avg devices → (depth, H)
-            if jax.process_index() == 0:
-                depth = cfg.depth
-                alog = {}
-                for li in [0, depth // 2, depth - 1]:
-                    alog[f'attn/entropy_layer{li}'] = float(ent[li].mean())
-                for h in range(cfg.num_heads):
-                    alog[f'attn/entropy_head{h}_last'] = float(ent[-1, h])
-                wandb.log(alog, step=step)
-        except Exception as e:
-            print(f"Attn entropy failed: {e}")
+        # TODO: Attention entropy logging — will be added post-training
+        # (requires unified attention impl to avoid param shape mismatch)
 
         # Sample grid
         if jax.process_index() == 0:

@@ -154,30 +154,27 @@ class PatchEmbed(nn.Module):
 
 
 class DiTBlock(nn.Module):
-    """adaLN-Zero DiT block. Always uses manual QKV attention (single param set)."""
+    """adaLN-Zero DiT block."""
     hidden_size: int
     num_heads: int
     mlp_ratio: float = 4.0
 
     @nn.compact
-    def __call__(self, x, c, return_attn=False):
+    def __call__(self, x, c):
         # adaLN modulation params
         c_proj = nn.Dense(
             6 * self.hidden_size, kernel_init=nn.initializers.constant(0.)
         )(nn.silu(c))
         shift_a, scale_a, gate_a, shift_m, scale_m, gate_m = jnp.split(c_proj, 6, axis=-1)
 
-        # ── Self-Attention (always same params, optionally returns weights) ──
+        # ── Self-Attention ──
         x_norm = modulate(
             nn.LayerNorm(use_bias=False, use_scale=False)(x), shift_a, scale_a
         )
-        hd = self.hidden_size // self.num_heads
-        qkv = nn.Dense(3 * self.hidden_size, kernel_init=nn.initializers.xavier_uniform())(x_norm)
-        q, k, v = [rearrange(t, 'b n (h d) -> b h n d', h=self.num_heads)
-                    for t in jnp.split(qkv, 3, axis=-1)]
-        attn_w = jax.nn.softmax(jnp.einsum('bhqd,bhkd->bhqk', q, k) * (hd ** -0.5), axis=-1)
-        attn_out = rearrange(jnp.einsum('bhqk,bhkd->bhqd', attn_w, v), 'b h n d -> b n (h d)')
-        attn_out = nn.Dense(self.hidden_size, kernel_init=nn.initializers.xavier_uniform())(attn_out)
+        attn_out = nn.MultiHeadDotProductAttention(
+            num_heads=self.num_heads,
+            kernel_init=nn.initializers.xavier_uniform(),
+        )(x_norm, x_norm)
         x = x + gate_a[:, None] * attn_out
 
         # ── MLP ──
@@ -190,7 +187,7 @@ class DiTBlock(nn.Module):
         h = nn.Dense(self.hidden_size, kernel_init=nn.initializers.xavier_uniform())(h)
         x = x + gate_m[:, None] * h
 
-        return (x, attn_w) if return_attn else x
+        return x
 
 
 class FinalLayer(nn.Module):
@@ -238,7 +235,7 @@ class DiT(nn.Module):
     learn_sigma: bool = False
 
     @nn.compact
-    def __call__(self, x, t, y, train=False, force_drop_ids=None, return_attn=False):
+    def __call__(self, x, t, y, train=False, force_drop_ids=None):
         """
         x: (B, H, W, C)   noisy image / latent
         t: (B,)            timestep ∈ [0, 1]
@@ -270,13 +267,8 @@ class DiT(nn.Module):
         c = t_emb + y_emb
 
         # Transformer blocks
-        attn_list = []
         for _ in range(self.depth):
-            if return_attn:
-                x, aw = DiTBlock(self.hidden_size, self.num_heads, self.mlp_ratio)(x, c, True)
-                attn_list.append(aw)
-            else:
-                x = DiTBlock(self.hidden_size, self.num_heads, self.mlp_ratio)(x, c)
+            x = DiTBlock(self.hidden_size, self.num_heads, self.mlp_ratio)(x, c)
 
         # Unpatchify
         x = FinalLayer(ps, C_out, self.hidden_size)(x, c)
@@ -284,4 +276,4 @@ class DiT(nn.Module):
         x = jnp.einsum('bhwpqc->bhpwqc', x)
         x = rearrange(x, 'B H P W Q C -> B (H P) (W Q) C')
 
-        return (x, attn_list) if return_attn else x
+        return x
