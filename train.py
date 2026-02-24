@@ -71,6 +71,9 @@ flags.DEFINE_string('tfrecord_compression_type', 'GZIP',
                     'Compression type for TFRecord episode shards ("", "GZIP").')
 flags.DEFINE_string('grain_arecord_dir', None,
                     'Directory containing train.arecord and val.arecord for grain mode.')
+flags.DEFINE_string('grain_path_remap', None,
+                    'Remap stored image paths: "old_prefix:new_prefix". '
+                    'E.g. "/workspace/data/miniimagenet:/kaggle/input/datasets/arjunashok33/miniimagenet"')
 flags.DEFINE_integer('online_cache_items', 1024,
                      'Max LRU cache items for online support embeddings.')
 flags.DEFINE_integer('online_siglip_batch_size', 256,
@@ -419,6 +422,17 @@ def main(_):
     # ── Data ───────────────────────────────────────────────────────────────
     if FLAGS.data_mode == 'grain':
         grain_mod = _get_grain_dataset_mod()
+        # Parse path remap: "old:new" → (old, new)
+        path_remap = None
+        if FLAGS.grain_path_remap:
+            parts = FLAGS.grain_path_remap.split(':', 1)
+            if len(parts) != 2:
+                raise ValueError(
+                    "--grain_path_remap must be 'old_prefix:new_prefix', "
+                    f"got: {FLAGS.grain_path_remap}"
+                )
+            path_remap = (parts[0], parts[1])
+            print(f"  Path remap: '{parts[0]}' → '{parts[1]}'")
         train_iter = grain_mod.build_grain_dataset(
             arecord_dir=FLAGS.grain_arecord_dir,
             split='train',
@@ -427,6 +441,7 @@ def main(_):
             is_train=True,
             seed=FLAGS.seed,
             load_support_seq=FLAGS.use_support_seq,
+            path_prefix_remap=path_remap,
         )
         val_iter = grain_mod.build_grain_dataset(
             arecord_dir=FLAGS.grain_arecord_dir,
@@ -436,6 +451,7 @@ def main(_):
             is_train=False,
             seed=FLAGS.seed + 1000,
             load_support_seq=FLAGS.use_support_seq,
+            path_prefix_remap=path_remap,
         )
     else:
         train_pattern = None

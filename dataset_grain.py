@@ -91,16 +91,23 @@ class DecodeEpisode:
     Output: dict with decoded numpy arrays matching the tfrecord contract.
     """
 
-    def __init__(self, image_size=224, is_train=True, load_support_seq=True):
+    def __init__(self, image_size=224, is_train=True, load_support_seq=True,
+                 path_prefix_remap=None):
         self._image_size = image_size
         self._is_train = is_train
         self._load_support_seq = load_support_seq
+        # (old_prefix, new_prefix) for remapping stored paths
+        self._path_prefix_remap = path_prefix_remap
 
     def __call__(self, record):
         # Decode target image
         target_path = record["target_path"]
         if isinstance(target_path, bytes):
             target_path = target_path.decode("utf-8")
+        if self._path_prefix_remap:
+            old, new = self._path_prefix_remap
+            if target_path.startswith(old):
+                target_path = new + target_path[len(old):]
 
         target = _decode_image(
             target_path,
@@ -170,6 +177,7 @@ def build_grain_dataset(
     is_train=True,
     seed=42,
     load_support_seq=True,
+    path_prefix_remap=None,
     num_threads=16,
     prefetch_buffer_size=500,
 ):
@@ -186,6 +194,8 @@ def build_grain_dataset(
         is_train: Whether to apply training augmentations.
         seed: Random seed for shuffling.
         load_support_seq: Whether to load support sequence tokens.
+        path_prefix_remap: Tuple (old_prefix, new_prefix) to remap stored
+            target_path. E.g. ('/workspace/data', '/kaggle/input/...')
         num_threads: Number of prefetch threads.
         prefetch_buffer_size: Prefetch buffer size.
 
@@ -208,6 +218,7 @@ def build_grain_dataset(
             image_size=image_size,
             is_train=is_train,
             load_support_seq=load_support_seq,
+            path_prefix_remap=path_prefix_remap,
         )
     )
 
