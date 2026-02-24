@@ -72,8 +72,9 @@ flags.DEFINE_string('tfrecord_compression_type', 'GZIP',
 flags.DEFINE_string('grain_arecord_dir', None,
                     'Directory containing train.arecord and val.arecord for grain mode.')
 flags.DEFINE_string('grain_path_remap', None,
-                    'Remap stored image paths: "old_prefix:new_prefix". '
-                    'E.g. "/workspace/data/miniimagenet:/kaggle/input/datasets/arjunashok33/miniimagenet"')
+                    'Remap stored image paths. Single: "old:new". '
+                    'Multiple: "old1:new1;old2:new2". '
+                    'E.g. "/workspace/data:/kaggle/input/data;/home/user:/kaggle/user"')
 flags.DEFINE_integer('online_cache_items', 1024,
                      'Max LRU cache items for online support embeddings.')
 flags.DEFINE_integer('online_siglip_batch_size', 256,
@@ -422,17 +423,21 @@ def main(_):
     # ── Data ───────────────────────────────────────────────────────────────
     if FLAGS.data_mode == 'grain':
         grain_mod = _get_grain_dataset_mod()
-        # Parse path remap: "old:new" → (old, new)
-        path_remap = None
+        # Parse path remap(s): "old:new" or "old1:new1;old2:new2"
+        path_remaps = None
         if FLAGS.grain_path_remap:
-            parts = FLAGS.grain_path_remap.split(':', 1)
-            if len(parts) != 2:
-                raise ValueError(
-                    "--grain_path_remap must be 'old_prefix:new_prefix', "
-                    f"got: {FLAGS.grain_path_remap}"
-                )
-            path_remap = (parts[0], parts[1])
-            print(f"  Path remap: '{parts[0]}' → '{parts[1]}'")
+            path_remaps = []
+            for pair in FLAGS.grain_path_remap.split(';'):
+                pair = pair.strip()
+                if not pair:
+                    continue
+                parts = pair.split(':', 1)
+                if len(parts) != 2:
+                    raise ValueError(
+                        f"Each remap must be 'old:new', got: '{pair}'"
+                    )
+                path_remaps.append((parts[0], parts[1]))
+                print(f"  Path remap: '{parts[0]}' → '{parts[1]}'")
         train_iter = grain_mod.build_grain_dataset(
             arecord_dir=FLAGS.grain_arecord_dir,
             split='train',
@@ -441,7 +446,7 @@ def main(_):
             is_train=True,
             seed=FLAGS.seed,
             load_support_seq=FLAGS.use_support_seq,
-            path_prefix_remap=path_remap,
+            path_prefix_remaps=path_remaps,
         )
         val_iter = grain_mod.build_grain_dataset(
             arecord_dir=FLAGS.grain_arecord_dir,
@@ -451,7 +456,7 @@ def main(_):
             is_train=False,
             seed=FLAGS.seed + 1000,
             load_support_seq=FLAGS.use_support_seq,
-            path_prefix_remap=path_remap,
+            path_prefix_remaps=path_remaps,
         )
     else:
         train_pattern = None

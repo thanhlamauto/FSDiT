@@ -92,22 +92,23 @@ class DecodeEpisode:
     """
 
     def __init__(self, image_size=224, is_train=True, load_support_seq=True,
-                 path_prefix_remap=None):
+                 path_prefix_remaps=None):
         self._image_size = image_size
         self._is_train = is_train
         self._load_support_seq = load_support_seq
-        # (old_prefix, new_prefix) for remapping stored paths
-        self._path_prefix_remap = path_prefix_remap
+        # list of (old_prefix, new_prefix) for remapping stored paths
+        self._path_prefix_remaps = path_prefix_remaps or []
 
     def __call__(self, record):
         # Decode target image
         target_path = record["target_path"]
         if isinstance(target_path, bytes):
             target_path = target_path.decode("utf-8")
-        if self._path_prefix_remap:
-            old, new = self._path_prefix_remap
-            if target_path.startswith(old):
-                target_path = new + target_path[len(old):]
+        if self._path_prefix_remaps:
+            for old, new in self._path_prefix_remaps:
+                if target_path.startswith(old):
+                    target_path = new + target_path[len(old):]
+                    break  # first match wins
 
         target = _decode_image(
             target_path,
@@ -177,7 +178,7 @@ def build_grain_dataset(
     is_train=True,
     seed=42,
     load_support_seq=True,
-    path_prefix_remap=None,
+    path_prefix_remaps=None,
     num_threads=16,
     prefetch_buffer_size=500,
 ):
@@ -194,8 +195,8 @@ def build_grain_dataset(
         is_train: Whether to apply training augmentations.
         seed: Random seed for shuffling.
         load_support_seq: Whether to load support sequence tokens.
-        path_prefix_remap: Tuple (old_prefix, new_prefix) to remap stored
-            target_path. E.g. ('/workspace/data', '/kaggle/input/...')
+        path_prefix_remaps: List of (old_prefix, new_prefix) tuples to remap
+            stored target_path. E.g. [('/workspace/data', '/kaggle/input/...')]
         num_threads: Number of prefetch threads.
         prefetch_buffer_size: Prefetch buffer size.
 
@@ -221,7 +222,7 @@ def build_grain_dataset(
                 image_size=image_size,
                 is_train=is_train,
                 load_support_seq=load_support_seq,
-                path_prefix_remap=path_prefix_remap,
+                path_prefix_remaps=path_prefix_remaps,
             )
         )
         ds = ds.batch(batch_size=batch_size, drop_remainder=True)
