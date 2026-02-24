@@ -109,15 +109,19 @@ class DecodeEpisode:
             rng=np.random.RandomState(),
         )
 
-        # Decode support embeddings
+        # Decode support embeddings — infer num_supports from byte size
+        EMBED_DIM = 768
         pooled_bytes = record["supports_pooled"]
-        supports_pooled = np.frombuffer(pooled_bytes, dtype=np.float16).reshape(5, 768).copy()
+        pooled_flat = np.frombuffer(pooled_bytes, dtype=np.float16).copy()
+        num_supports = len(pooled_flat) // EMBED_DIM
+        supports_pooled = pooled_flat.reshape(num_supports, EMBED_DIM)
 
         seq_bytes = record["supports_seq"]
         if self._load_support_seq and len(seq_bytes) > 0:
-            supports_seq = np.frombuffer(seq_bytes, dtype=np.float16).reshape(5, 196, 768).copy()
+            seq_flat = np.frombuffer(seq_bytes, dtype=np.float16).copy()
+            supports_seq = seq_flat.reshape(num_supports, 196, EMBED_DIM)
         else:
-            supports_seq = np.zeros((5, 196, 768), dtype=np.float16)
+            supports_seq = np.zeros((num_supports, 196, EMBED_DIM), dtype=np.float16)
 
         class_id = np.int32(record["class_id"])
 
