@@ -46,6 +46,15 @@ from utils.stable_vae import StableVAE
 from utils.online_support_encoder import OnlineSupportEncoder
 from utils.wandb_utils import setup_wandb, default_wandb_config
 
+# Lazy import for grain mode (only needed when --data_mode=grain)
+_grain_dataset_mod = None
+def _get_grain_dataset_mod():
+    global _grain_dataset_mod
+    if _grain_dataset_mod is None:
+        import dataset_grain as m
+        _grain_dataset_mod = m
+    return _grain_dataset_mod
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Flags & Config
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -54,12 +63,14 @@ FLAGS = flags.FLAGS
 # Paths
 flags.DEFINE_string('data_dir', '/kaggle/input/datasets/arjunashok33/miniimagenet',
                     'miniImageNet root (contains train/, val/, test/).')
-flags.DEFINE_enum('data_mode', 'online', ['online', 'tfrecord'],
-                  'Data mode: online (support_paths + runtime SigLIP) or tfrecord.')
+flags.DEFINE_enum('data_mode', 'online', ['online', 'tfrecord', 'grain'],
+                  'Data mode: online (support_paths + runtime SigLIP), tfrecord, or grain (ArrayRecord).')
 flags.DEFINE_string('episode_tfrecord_dir', None,
                     'TFRecord episode root with train/*.tfrecord and val/*.tfrecord.')
 flags.DEFINE_string('tfrecord_compression_type', 'GZIP',
                     'Compression type for TFRecord episode shards ("", "GZIP").')
+flags.DEFINE_string('grain_arecord_dir', None,
+                    'Directory containing train.arecord and val.arecord for grain mode.')
 flags.DEFINE_integer('online_cache_items', 1024,
                      'Max LRU cache items for online support embeddings.')
 flags.DEFINE_integer('online_siglip_batch_size', 256,
@@ -392,6 +403,13 @@ def main(_):
                 "(expected train/*.tfrecord and val/*.tfrecord)."
             )
         print(f"Data mode: tfrecord ({FLAGS.episode_tfrecord_dir})")
+    elif FLAGS.data_mode == 'grain':
+        if not FLAGS.grain_arecord_dir:
+            raise ValueError(
+                "When --data_mode=grain, please set --grain_arecord_dir "
+                "(expected directory with train.arecord and val.arecord)."
+            )
+        print(f"Data mode: grain ({FLAGS.grain_arecord_dir})")
     else:
         print("Data mode: online (support_paths + runtime SigLIP)")
 
@@ -399,32 +417,53 @@ def main(_):
         setup_wandb(cfg.to_dict(), **FLAGS.wandb)
 
     # ── Data ───────────────────────────────────────────────────────────────
-    train_pattern = None
-    val_pattern = None
-    if FLAGS.data_mode == 'tfrecord':
-        train_pattern = os.path.join(FLAGS.episode_tfrecord_dir, 'train', 'train-*.tfrecord')
-        val_pattern = os.path.join(FLAGS.episode_tfrecord_dir, 'val', 'val-*.tfrecord')
+    if FLAGS.data_mode == 'grain':
+        grain_mod = _get_grain_dataset_mod()
+        train_arecord = os.path.join(FLAGS.grain_arecord_dir, 'train.arecord')
+        val_arecord = os.path.join(FLAGS.grain_arecord_dir, 'val.arecord')
+        train_iter = grain_mod.build_grain_dataset(
+            arecord_path=train_arecord,
+            batch_size=local_bs,
+            image_size=cfg.image_size,
+            is_train=True,
+            seed=FLAGS.seed,
+            load_support_seq=FLAGS.use_support_seq,
+        )
+        val_iter = grain_mod.build_grain_dataset(
+            arecord_path=val_arecord,
+            batch_size=local_bs,
+            image_size=cfg.image_size,
+            is_train=False,
+            seed=FLAGS.seed + 1000,
+            load_support_seq=FLAGS.use_support_seq,
+        )
+    else:
+        train_pattern = None
+        val_pattern = None
+        if FLAGS.data_mode == 'tfrecord':
+            train_pattern = os.path.join(FLAGS.episode_tfrecord_dir, 'train', 'train-*.tfrecord')
+            val_pattern = os.path.join(FLAGS.episode_tfrecord_dir, 'val', 'val-*.tfrecord')
 
-    train_ds, _ = build_dataset(
-        os.path.join(FLAGS.data_dir, 'train'), local_bs,
-        image_size=cfg.image_size, num_sets=FLAGS.num_sets,
-        is_train=True, seed=FLAGS.seed, debug_n=FLAGS.debug_overfit,
-        load_support_seq=FLAGS.use_support_seq,
-        data_mode=FLAGS.data_mode,
-        episode_tfrecord_pattern=train_pattern,
-        tfrecord_compression_type=FLAGS.tfrecord_compression_type,
-    )
-    val_ds, _ = build_dataset(
-        os.path.join(FLAGS.data_dir, 'val'), local_bs,
-        image_size=cfg.image_size, num_sets=FLAGS.num_sets,
-        is_train=False, seed=FLAGS.seed + 1000,
-        load_support_seq=FLAGS.use_support_seq,
-        data_mode=FLAGS.data_mode,
-        episode_tfrecord_pattern=val_pattern,
-        tfrecord_compression_type=FLAGS.tfrecord_compression_type,
-    )
-    train_iter = iter(train_ds.as_numpy_iterator())
-    val_iter = iter(val_ds.as_numpy_iterator())
+        train_ds, _ = build_dataset(
+            os.path.join(FLAGS.data_dir, 'train'), local_bs,
+            image_size=cfg.image_size, num_sets=FLAGS.num_sets,
+            is_train=True, seed=FLAGS.seed, debug_n=FLAGS.debug_overfit,
+            load_support_seq=FLAGS.use_support_seq,
+            data_mode=FLAGS.data_mode,
+            episode_tfrecord_pattern=train_pattern,
+            tfrecord_compression_type=FLAGS.tfrecord_compression_type,
+        )
+        val_ds, _ = build_dataset(
+            os.path.join(FLAGS.data_dir, 'val'), local_bs,
+            image_size=cfg.image_size, num_sets=FLAGS.num_sets,
+            is_train=False, seed=FLAGS.seed + 1000,
+            load_support_seq=FLAGS.use_support_seq,
+            data_mode=FLAGS.data_mode,
+            episode_tfrecord_pattern=val_pattern,
+            tfrecord_compression_type=FLAGS.tfrecord_compression_type,
+        )
+        train_iter = iter(train_ds.as_numpy_iterator())
+        val_iter = iter(val_ds.as_numpy_iterator())
 
     online_encoder = None
     if FLAGS.data_mode == 'online':
@@ -534,7 +573,10 @@ def main(_):
           siglip_stats : dict or None
         """
         siglip_stats = None
-        if FLAGS.data_mode == 'online':
+        if FLAGS.data_mode == 'grain':
+            pooled_5 = batch['supports_pooled']
+            seq_5 = batch['supports_seq'] if FLAGS.use_support_seq else None
+        elif FLAGS.data_mode == 'online':
             pooled_5, seq_5, siglip_stats = online_encoder.encode_paths(
                 batch['support_paths'],
                 need_seq=bool(FLAGS.use_support_seq),

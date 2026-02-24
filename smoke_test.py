@@ -21,6 +21,11 @@ tf.config.set_visible_devices([], "GPU")
 tf.config.set_visible_devices([], "TPU")
 
 
+def _lazy_import_grain_dataset():
+    import dataset_grain
+    return dataset_grain
+
+
 def _resolve_train_dir(data_dir):
     train_dir = os.path.join(data_dir, "train")
     return train_dir if os.path.isdir(train_dir) else data_dir
@@ -99,9 +104,46 @@ def check_dataset_contract_online(data_dir, batch_size, image_size, num_sets):
     return batch
 
 
+def check_dataset_contract_grain(grain_arecord_dir, batch_size, image_size, use_support_seq):
+    grain_mod = _lazy_import_grain_dataset()
+    import os
+    train_arecord = os.path.join(grain_arecord_dir, "train.arecord")
+    ds_iter = grain_mod.build_grain_dataset(
+        arecord_path=train_arecord,
+        batch_size=batch_size,
+        image_size=image_size,
+        is_train=False,
+        seed=0,
+        load_support_seq=use_support_seq,
+    )
+    batch = next(ds_iter)
+
+    expected_keys = {"target", "supports_seq", "supports_pooled", "class_id"}
+    got_keys = set(batch.keys())
+    if got_keys != expected_keys:
+        raise AssertionError(f"Dataset keys mismatch: got={got_keys}, expected={expected_keys}")
+
+    target = batch["target"]
+    supports_seq = batch["supports_seq"]
+    supports_pooled = batch["supports_pooled"]
+
+    if target.ndim != 4 or target.shape[-1] != 3:
+        raise AssertionError(f"target must be (B,H,W,3), got {target.shape}")
+    if supports_seq.shape[1:] != (5, 196, 768):
+        raise AssertionError(f"supports_seq must be (B,5,196,768), got {supports_seq.shape}")
+    if supports_pooled.shape[1:] != (5, 768):
+        raise AssertionError(f"supports_pooled must be (B,5,768), got {supports_pooled.shape}")
+    if not np.isfinite(target).all() or not np.isfinite(supports_seq).all() or not np.isfinite(supports_pooled).all():
+        raise AssertionError("Non-finite values found in grain dataset batch.")
+
+    print("[OK] Dataset contract (grain):"
+          f" target={target.shape}, supports_seq={supports_seq.shape}, supports_pooled={supports_pooled.shape}")
+    return batch
+
+
 def build_condition(batch, data_mode, image_size, use_support_seq, online_cache_items, online_siglip_batch_size, online_siglip_no_pmap):
     bsz = min(2, batch["target"].shape[0])
-    if data_mode == "tfrecord":
+    if data_mode in ("tfrecord", "grain"):
         pooled = batch["supports_pooled"][:bsz]
         y_pooled = pooled.mean(axis=1, dtype=np.float32)
         y_seq = None
@@ -199,8 +241,9 @@ def check_model_forward(batch, y_pooled_np, y_seq_np):
 def main():
     parser = argparse.ArgumentParser(description="Run FSDiT smoke tests.")
     parser.add_argument("--data_dir", required=True, help="miniImageNet split root or train folder.")
-    parser.add_argument("--data_mode", choices=["online", "tfrecord"], default="online")
+    parser.add_argument("--data_mode", choices=["online", "tfrecord", "grain"], default="online")
     parser.add_argument("--episode_tfrecord_dir", default=None, help="Episode TFRecord root (tfrecord mode only).")
+    parser.add_argument("--grain_arecord_dir", default=None, help="ArrayRecord episode dir (grain mode only).")
     parser.add_argument("--use_support_seq", type=int, default=1)
     parser.add_argument("--online_cache_items", type=int, default=128)
     parser.add_argument("--online_siglip_batch_size", type=int, default=64)
@@ -217,6 +260,13 @@ def main():
             args.batch_size,
             args.image_size,
             args.num_sets,
+        )
+    elif args.data_mode == "grain":
+        batch = check_dataset_contract_grain(
+            args.grain_arecord_dir,
+            args.batch_size,
+            args.image_size,
+            bool(args.use_support_seq),
         )
     else:
         batch = check_dataset_contract_online(
