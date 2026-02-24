@@ -82,6 +82,53 @@ class SigLIP2Encoder:
         zimg, _, _ = self.model.apply({'params': self.params}, images, None)
         return jax.lax.stop_gradient(zimg)
 
+    def _encode_both(self, images):
+        """
+        (N, 224, 224, 3) → ((N, 196, 768), (N, 768)), frozen.
+
+        Fail-fast if sequence tokens are unavailable or malformed.
+        """
+        outputs = self.model.apply({'params': self.params}, images, None)
+        leaves = []
+
+        def _collect(node):
+            if isinstance(node, (tuple, list)):
+                for v in node:
+                    _collect(v)
+            elif isinstance(node, dict):
+                for v in node.values():
+                    _collect(v)
+            elif hasattr(node, 'shape'):
+                leaves.append(node)
+
+        _collect(outputs)
+        if not leaves:
+            raise ValueError("SigLIP2 output has no tensor leaves to parse.")
+
+        bsz = images.shape[0]
+        pooled = None
+        seq = None
+        seen_shapes = []
+        for arr in leaves:
+            shape = tuple(arr.shape)
+            seen_shapes.append(shape)
+            if len(shape) == 2 and shape[0] == bsz and shape[1] == self.EMBED_DIM:
+                pooled = arr if pooled is None else pooled
+            if len(shape) == 3 and shape[0] == bsz and shape[-1] == self.EMBED_DIM and shape[1] == 196:
+                seq = arr if seq is None else seq
+
+        if pooled is None or seq is None:
+            shape_str = ", ".join(str(s) for s in sorted(set(seen_shapes)))
+            raise ValueError(
+                "Failed to extract SigLIP2 outputs with expected shapes "
+                f"(N, 196, {self.EMBED_DIM}) and (N, {self.EMBED_DIM}). "
+                f"Observed leaves: [{shape_str}]"
+            )
+
+        seq = jax.lax.stop_gradient(seq)
+        pooled = jax.lax.stop_gradient(pooled)
+        return seq, pooled
+
     @partial(jax.jit, static_argnums=(0,))
     def encode_supports(self, support_images):
         """
