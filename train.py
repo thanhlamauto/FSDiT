@@ -419,10 +419,9 @@ def main(_):
     # ── Data ───────────────────────────────────────────────────────────────
     if FLAGS.data_mode == 'grain':
         grain_mod = _get_grain_dataset_mod()
-        train_arecord = os.path.join(FLAGS.grain_arecord_dir, 'train.arecord')
-        val_arecord = os.path.join(FLAGS.grain_arecord_dir, 'val.arecord')
         train_iter = grain_mod.build_grain_dataset(
-            arecord_path=train_arecord,
+            arecord_dir=FLAGS.grain_arecord_dir,
+            split='train',
             batch_size=local_bs,
             image_size=cfg.image_size,
             is_train=True,
@@ -430,7 +429,8 @@ def main(_):
             load_support_seq=FLAGS.use_support_seq,
         )
         val_iter = grain_mod.build_grain_dataset(
-            arecord_path=val_arecord,
+            arecord_dir=FLAGS.grain_arecord_dir,
+            split='val',
             batch_size=local_bs,
             image_size=cfg.image_size,
             is_train=False,

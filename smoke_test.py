@@ -106,10 +106,9 @@ def check_dataset_contract_online(data_dir, batch_size, image_size, num_sets):
 
 def check_dataset_contract_grain(grain_arecord_dir, batch_size, image_size, use_support_seq):
     grain_mod = _lazy_import_grain_dataset()
-    import os
-    train_arecord = os.path.join(grain_arecord_dir, "train.arecord")
     ds_iter = grain_mod.build_grain_dataset(
-        arecord_path=train_arecord,
+        arecord_dir=grain_arecord_dir,
+        split="train",
         batch_size=batch_size,
         image_size=image_size,
         is_train=False,

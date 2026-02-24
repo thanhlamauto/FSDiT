@@ -1,8 +1,12 @@
 """
 dataset_grain.py — Grain-based dataset loader for FSDiT.
 
-Reads episode-level ArrayRecord files and provides a Grain pipeline.
-Designed as a drop-in replacement for the tfrecord path in dataset.py.
+Reads episode-level ArrayRecord files (single or sharded) and provides
+a Grain pipeline. Drop-in replacement for the tfrecord path in dataset.py.
+
+Supports two layouts:
+  1) Single file:   train.arecord
+  2) Sharded files:  train_shard_000.arecord, train_shard_001.arecord, ...
 
 Output contract (matches tfrecord mode):
   {
@@ -11,18 +15,11 @@ Output contract (matches tfrecord mode):
       'supports_seq': (B, 5, 196, 768) float16,
       'class_id': (B,) int32,
   }
-
-Usage in train.py:
-  from dataset_grain import build_grain_dataset
-  train_ds = build_grain_dataset(
-      arecord_path="episodes_arecord/train.arecord",
-      batch_size=128, image_size=224, is_train=True, seed=42,
-  )
-  for batch in train_ds:
-      train_step(batch)
 """
 
+import glob
 import os
+from typing import List
 
 import grain
 import msgpack
@@ -52,17 +49,11 @@ def _decode_image(path, image_size, is_train, rng=None):
     return arr
 
 
-# ─── ArrayRecord data source ─────────────────────────────────────────────────
+# ─── ArrayRecord data sources ────────────────────────────────────────────────
 
 class EpisodeSource(grain.RandomAccessDataSource):
     """
-    RandomAccessDataSource backed by an ArrayRecord of msgpack episodes.
-
-    Each record contains:
-      - target_path: str
-      - class_id: int
-      - supports_pooled: bytes (float16 [5,768])
-      - supports_seq: bytes (float16 [5,196,768]) or b""
+    RandomAccessDataSource backed by a SINGLE ArrayRecord file.
     """
 
     def __init__(self, arecord_path):
@@ -78,8 +69,63 @@ class EpisodeSource(grain.RandomAccessDataSource):
 
     def __getitem__(self, idx):
         raw = self._reader.read([idx])
-        record = msgpack.unpackb(raw[0], raw=False)
-        return record
+        return msgpack.unpackb(raw[0], raw=False)
+
+
+class ShardedEpisodeSource(grain.RandomAccessDataSource):
+    """
+    RandomAccessDataSource backed by MULTIPLE ArrayRecord shard files.
+
+    Presents a unified view: indices [0, total_records) are mapped to the
+    correct shard and local index automatically.
+
+    Example:
+      shard_000: 12000 records  → global idx [0, 12000)
+      shard_001: 12000 records  → global idx [12000, 24000)
+      shard_002: 12000 records  → global idx [24000, 36000)
+    """
+
+    def __init__(self, arecord_paths: List[str]):
+        if not arecord_paths:
+            raise ValueError("No ArrayRecord shard paths provided.")
+
+        self._readers = []
+        self._cumulative = [0]  # cumulative record counts
+        total = 0
+        for path in sorted(arecord_paths):
+            if not os.path.exists(path):
+                raise FileNotFoundError(f"Shard not found: {path}")
+            reader = ArrayRecordReader(path)
+            n = reader.num_records()
+            if n == 0:
+                print(f"[Warning] Empty shard: {path}")
+                continue
+            self._readers.append(reader)
+            total += n
+            self._cumulative.append(total)
+            print(f"  [Grain] shard {path}: {n} records")
+
+        self._total = total
+        if self._total == 0:
+            raise ValueError("All shards are empty.")
+        print(f"  [Grain] total: {self._total} records across {len(self._readers)} shards")
+
+    def __len__(self):
+        return self._total
+
+    def __getitem__(self, idx):
+        # Binary search for the correct shard
+        lo, hi = 0, len(self._readers) - 1
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if idx < self._cumulative[mid + 1]:
+                hi = mid
+            else:
+                lo = mid + 1
+        shard_idx = lo
+        local_idx = idx - self._cumulative[shard_idx]
+        raw = self._readers[shard_idx].read([local_idx])
+        return msgpack.unpackb(raw[0], raw=False)
 
 
 # ─── Grain transforms ────────────────────────────────────────────────────────
@@ -88,7 +134,7 @@ class DecodeEpisode(grain.MapTransform):
     """
     Decode a raw msgpack record into numpy arrays.
 
-    Input: dict from EpisodeSource.__getitem__
+    Input: dict from EpisodeSource/ShardedEpisodeSource.__getitem__
     Output: dict with decoded numpy arrays matching the tfrecord contract.
     """
 
@@ -107,7 +153,7 @@ class DecodeEpisode(grain.MapTransform):
             target_path,
             self._image_size,
             self._is_train,
-            rng=np.random.RandomState(),  # thread-local RNG for augmentation
+            rng=np.random.RandomState(),
         )
 
         # Decode support embeddings
@@ -130,10 +176,40 @@ class DecodeEpisode(grain.MapTransform):
         }
 
 
+# ─── Auto-discover shards ────────────────────────────────────────────────────
+
+def _discover_arecord_files(arecord_dir, split):
+    """
+    Auto-discover ArrayRecord files for a split.
+
+    Search order:
+      1) {split}_shard_*.arecord  (sharded)
+      2) {split}.arecord          (single file)
+
+    Returns list of paths.
+    """
+    # Try sharded pattern first
+    pattern = os.path.join(arecord_dir, f"{split}_shard_*.arecord")
+    shards = sorted(glob.glob(pattern))
+    if shards:
+        return shards
+
+    # Try single file
+    single = os.path.join(arecord_dir, f"{split}.arecord")
+    if os.path.exists(single):
+        return [single]
+
+    raise FileNotFoundError(
+        f"No ArrayRecord files found for split '{split}' in {arecord_dir}. "
+        f"Expected {split}.arecord or {split}_shard_*.arecord"
+    )
+
+
 # ─── Pipeline builder ────────────────────────────────────────────────────────
 
 def build_grain_dataset(
-    arecord_path,
+    arecord_dir,
+    split,
     batch_size,
     image_size=224,
     is_train=True,
@@ -143,10 +219,13 @@ def build_grain_dataset(
     prefetch_buffer_size=500,
 ):
     """
-    Build a Grain dataset pipeline from an ArrayRecord file.
+    Build a Grain dataset pipeline from ArrayRecord file(s).
+
+    Automatically detects single vs sharded layout.
 
     Args:
-        arecord_path: Path to the .arecord file.
+        arecord_dir: Directory containing .arecord files.
+        split: Split name ('train' or 'val').
         batch_size: Batch size.
         image_size: Image resolution for target decode.
         is_train: Whether to apply training augmentations.
@@ -158,11 +237,15 @@ def build_grain_dataset(
     Returns:
         Grain DatasetIterator yielding batched numpy dicts.
     """
-    source = EpisodeSource(arecord_path)
-    print(
-        f"[Grain] {arecord_path}: {len(source)} episodes, "
-        f"batch_size={batch_size}, is_train={is_train}"
-    )
+    paths = _discover_arecord_files(arecord_dir, split)
+    print(f"[Grain] {split}: found {len(paths)} file(s)")
+
+    if len(paths) == 1:
+        source = EpisodeSource(paths[0])
+    else:
+        source = ShardedEpisodeSource(paths)
+
+    print(f"[Grain] {split}: {len(source)} episodes, batch_size={batch_size}, is_train={is_train}")
 
     dataset = grain.MapDataset.source(source)
 
