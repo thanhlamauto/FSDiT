@@ -99,6 +99,98 @@ Use this only when you explicitly want precomputed shard benchmarks:
   - `seq`: `(196, 768)` (SigLIP2 patch tokens)
   - `pooled`: `(768,)` (SigLIP2 pooled embedding)
 
+### Offline ArrayRecord layout (for GPU / Kaggle)
+
+When using the PyTorch SigLIP2 precompute + ArrayRecord pipeline on GPU, we materialize
+episode-level ArrayRecord files on disk:
+
+- Precompute embeddings with `precompute_siglip_pytorch.py`:
+  - Inputs: `/path/to/miniimagenet/{train,val}/*/*.JPEG`
+  - Outputs: `.npz` next to each image with:
+    - `seq`: `(196, 768)` float16
+    - `pooled`: `(768,)` float16
+
+- Build episodes as ArrayRecord with `build_episodes_arrayrecord.py`:
+  - Example:
+    - `--data_dir /workspace/data/miniimagenet`
+    - `--embeddings_dir /workspace/data/miniimagenet`
+    - `--out_dir /workspace/data/episodes_arecord`
+    - `--splits train,val`
+    - `--store_seq 1`
+  - Output layout:
+    - `/workspace/data/episodes_arecord/train.arecord`
+    - `/workspace/data/episodes_arecord/train_meta.json`
+    - `/workspace/data/episodes_arecord/val.arecord`
+    - `/workspace/data/episodes_arecord/val_meta.json`
+
+Each record in `*.arecord` is a msgpack blob with:
+
+- `target_path`: string (absolute path to target image on disk)
+- `class_id`: int
+- `supports_pooled`: bytes (float16 `[5, 768]`)
+- `supports_seq`: bytes (float16 `[5, 196, 768]`) or `b""` when `--store_seq=0`
+
+These records are loaded in Python via:
+
+```python
+from dataset_grain import build_grain_dataset
+
+train_ds = build_grain_dataset(
+    arecord_path="/workspace/data/episodes_arecord/train.arecord",
+    batch_size=128,
+    image_size=224,
+    is_train=True,
+    seed=42,
+    load_support_seq=True,
+)
+```
+
+### Sharding train ArrayRecord for Kaggle (file size < 20GB)
+
+Kaggle enforces a per-file size limit (~20GB). A full `train.arecord` with `store_seq=1`
+can be larger than this, so we provide a small utility to shard it into multiple
+independent ArrayRecord files:
+
+- Script: `shard_arrayrecord.py`
+- Example usage:
+
+```bash
+python shard_arrayrecord.py \
+  --src /workspace/data/episodes_arecord/train.arecord \
+  --out_dir /workspace/data/episodes_arecord \
+  --num_shards 3
+```
+
+This reads `train.arecord` with `ArrayRecordReader` and writes sequential record ranges
+into shard files:
+
+- `/workspace/data/episodes_arecord/train_shard_000.arecord`  (~<20GB)
+- `/workspace/data/episodes_arecord/train_shard_001.arecord`  (~<20GB)
+- `/workspace/data/episodes_arecord/train_shard_002.arecord`  (<20GB)
+
+Each shard is a valid ArrayRecord file and can be loaded independently with
+`build_grain_dataset` by pointing `arecord_path` to the shard instead of the full
+`train.arecord`. On Kaggle you typically upload:
+
+- `train_shard_000.arecord`
+- `train_shard_001.arecord`
+- `train_shard_002.arecord`
+- `val.arecord`
+
+and then in your notebook:
+
+```python
+from dataset_grain import build_grain_dataset
+
+train_ds = build_grain_dataset(
+    arecord_path="/kaggle/input/your-dataset/train_shard_000.arecord",
+    batch_size=128,
+    image_size=224,
+    is_train=True,
+    seed=42,
+)
+```
+
 ## WandB Dashboard
 
 - **Train**: loss (EMA), grad_norm, lr, step_time, loss per t-bin
