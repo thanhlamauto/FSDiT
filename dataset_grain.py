@@ -200,35 +200,61 @@ def build_grain_dataset(
         prefetch_buffer_size: Prefetch buffer size.
 
     Returns:
-        Grain DatasetIterator yielding batched numpy dicts.
+        Infinite iterator yielding batched numpy dicts (auto-repeats epochs).
     """
     paths = _discover_arecord_files(arecord_dir, split)
     print(f"[Grain] {split}: found {len(paths)} file(s)")
 
     source = MsgpackEpisodeSource(paths)
-    print(f"[Grain] {split}: {len(source)} episodes, batch_size={batch_size}, is_train={is_train}")
+    n_records = len(source)
+    n_batches = n_records // batch_size
+    print(f"[Grain] {split}: {n_records} episodes, batch_size={batch_size}, "
+          f"~{n_batches} batches/epoch, is_train={is_train}")
 
-    dataset = grain.MapDataset.source(source)
-
-    if is_train:
-        dataset = dataset.shuffle(seed=seed)
-
-    dataset = dataset.map(
-        DecodeEpisode(
-            image_size=image_size,
-            is_train=is_train,
-            load_support_seq=load_support_seq,
-            path_prefix_remap=path_prefix_remap,
+    def _make_iter(epoch_seed):
+        """Build a fresh 1-epoch Grain iterator."""
+        ds = grain.MapDataset.source(source)
+        if is_train:
+            ds = ds.shuffle(seed=epoch_seed)
+        ds = ds.map(
+            DecodeEpisode(
+                image_size=image_size,
+                is_train=is_train,
+                load_support_seq=load_support_seq,
+                path_prefix_remap=path_prefix_remap,
+            )
         )
-    )
-
-    dataset = dataset.batch(batch_size=batch_size, drop_remainder=True)
-
-    iter_dataset = dataset.to_iter_dataset(
-        grain.ReadOptions(
-            num_threads=num_threads,
-            prefetch_buffer_size=prefetch_buffer_size,
+        ds = ds.batch(batch_size=batch_size, drop_remainder=True)
+        it = ds.to_iter_dataset(
+            grain.ReadOptions(
+                num_threads=num_threads,
+                prefetch_buffer_size=prefetch_buffer_size,
+            )
         )
-    )
+        return iter(it)
 
-    return iter(iter_dataset)
+    return _InfiniteGrainIterator(_make_iter, seed)
+
+
+class _InfiniteGrainIterator:
+    """Wraps a Grain iterator factory to auto-restart on epoch end."""
+
+    def __init__(self, make_iter_fn, base_seed):
+        self._make_iter_fn = make_iter_fn
+        self._base_seed = base_seed
+        self._epoch = 0
+        self._iter = make_iter_fn(base_seed)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        while True:
+            try:
+                return next(self._iter)
+            except StopIteration:
+                self._epoch += 1
+                new_seed = self._base_seed + self._epoch
+                self._iter = self._make_iter_fn(new_seed)
+                # continue to next(self._iter) on next loop iteration
+
