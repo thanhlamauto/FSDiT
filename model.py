@@ -367,6 +367,10 @@ class DiT(nn.Module):
             y_emb = LabelEmbedder(
                 self.class_dropout_prob, self.num_classes, self.hidden_size
             )(y_pooled, train=train, force_drop_ids=force_drop_ids)
+
+        # Normalize both to same scale before combining
+        t_emb = nn.LayerNorm(name='t_emb_ln')(t_emb)
+        y_emb = nn.LayerNorm(name='y_emb_ln')(y_emb)
         c = t_emb + y_emb
 
         debug = None
