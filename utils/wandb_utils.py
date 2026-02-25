@@ -64,5 +64,6 @@ def setup_wandb(hyperparam_dict, entity=None, project="fsdit", group=None, name=
         settings=wandb.Settings(start_method="thread", _disable_stats=False),
         mode="offline" if offline else "online", save_code=True, **kw,
     )
-    wandb.config.update(get_flag_dict())
+    flag_dict = {k: v for k, v in get_flag_dict().items() if v is not None}
+    wandb.config.update(flag_dict, allow_val_change=True)
     return run
