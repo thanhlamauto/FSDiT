@@ -97,6 +97,9 @@ flags.DEFINE_integer('batch_size', 128, 'Global batch size.')
 flags.DEFINE_integer('max_steps', 200_000, 'Total training steps.')
 flags.DEFINE_integer('num_sets', 100, 'Sets per class (each set = 6 images).')
 flags.DEFINE_integer('debug_overfit', 0, 'Overfit on N samples (0 = off).')
+flags.DEFINE_float('cond_dropout', None, 'Override cond_dropout (CFG dropout rate). Default: 0.1.')
+flags.DEFINE_float('weight_decay', None, 'Override weight_decay. Default: 0.01.')
+flags.DEFINE_float('lr', None, 'Override peak learning rate. Default: 1e-4.')
 flags.DEFINE_bool('use_support_seq', True, 'Use support sequence context for cross-attention.')
 flags.DEFINE_bool('suppress_diffusers_warnings', True, 'Suppress repeated diffusers Flax deprecation warnings.')
 flags.DEFINE_bool('log_model_debug', True, 'Log model activation/condition debug metrics.')
@@ -351,6 +354,13 @@ def main(_):
         cfg[k] = v
     cfg.use_support_seq = int(FLAGS.use_support_seq)
     cfg.log_model_debug = int(FLAGS.log_model_debug)
+    # CLI overrides for tuning
+    if FLAGS.cond_dropout is not None:
+        cfg.cond_dropout = FLAGS.cond_dropout
+    if FLAGS.weight_decay is not None:
+        cfg.weight_decay = FLAGS.weight_decay
+    if FLAGS.lr is not None:
+        cfg.lr = FLAGS.lr
 
     if FLAGS.suppress_diffusers_warnings:
         warnings.filterwarnings(
