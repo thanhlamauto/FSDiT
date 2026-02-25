@@ -371,7 +371,9 @@ class DiT(nn.Module):
         # Normalize both to same scale before combining
         t_emb = nn.LayerNorm(name='t_emb_ln')(t_emb)
         y_emb = nn.LayerNorm(name='y_emb_ln')(y_emb)
-        c = t_emb + y_emb
+        # Learnable scale to boost condition signal (init > 1 to prevent suppression)
+        cond_scale = self.param('cond_scale', nn.initializers.constant(2.0), ())
+        c = t_emb + cond_scale * y_emb
 
         debug = None
         act_abs = []
