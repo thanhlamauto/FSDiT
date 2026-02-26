@@ -135,6 +135,7 @@ class DecodeEpisode:
 
         return {
             "target": target,
+            "target_path": target_path,
             "supports_pooled": supports_pooled,
             "supports_seq": supports_seq,
             "class_id": class_id,
