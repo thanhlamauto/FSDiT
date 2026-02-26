@@ -463,6 +463,7 @@ def main(_):
 
     online_encoder = None
     if FLAGS.data_mode == 'online':
+        print("Initializing OnlineSupportEncoder...")
         online_encoder = OnlineSupportEncoder(
             variant='B/16',
             image_size=cfg.image_size,
@@ -566,6 +567,9 @@ def main(_):
 
     def prepare_support_condition(batch):
         """
+        Self-reconstruction mode: encode the TARGET image with SigLIP
+        as the condition, so condition = exact target.
+
         Returns:
           pooled_global: (B,768) float32 (for stats)
           pooled_model : (B,768) float16 (for model input)
@@ -573,15 +577,28 @@ def main(_):
           siglip_stats : dict or None
         """
         siglip_stats = None
-        if FLAGS.data_mode == 'grain':
-            pooled_5 = batch['supports_pooled']
-            seq_5 = batch['supports_seq'] if FLAGS.use_support_seq else None
-        elif FLAGS.data_mode == 'online':
-            pooled_5, seq_5, siglip_stats = online_encoder.encode_paths(
-                batch['support_paths'],
-                need_seq=bool(FLAGS.use_support_seq),
-            )
+
+        if online_encoder is not None:
+            # Self-reconstruction: encode target image as its own condition
+            # target_paths shape: (B,) strings — each is path to the target img
+            # We wrap each target path as a (B, 1) "fake 1-shot support" array
+            target_paths = batch.get('target_path', None)
+            if target_paths is not None:
+                # Make shape (B, 1) so online_encoder treats it as 1-shot
+                if isinstance(target_paths, np.ndarray):
+                    target_paths_1shot = target_paths.reshape(-1, 1)
+                else:
+                    target_paths_1shot = np.array(target_paths).reshape(-1, 1)
+                pooled_5, seq_5, siglip_stats = online_encoder.encode_paths(
+                    target_paths_1shot,
+                    need_seq=bool(FLAGS.use_support_seq),
+                )
+            else:
+                # Fallback: use stored support embeddings
+                pooled_5 = batch['supports_pooled']
+                seq_5 = batch['supports_seq'] if FLAGS.use_support_seq else None
         else:
+            # No online encoder available, use stored embeddings
             pooled_5 = batch['supports_pooled']
             seq_5 = batch['supports_seq'] if FLAGS.use_support_seq else None
 

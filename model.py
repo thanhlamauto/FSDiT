@@ -1,12 +1,11 @@
 """
-model.py — DiT (Diffusion Transformer) with FiLM conditioning.
+model.py — DiT with CLS-token cross-attention conditioning.
 
-Supports two modes:
-  1. Class-label conditioning (original DiT)
-  2. Support-set conditioning via SigLIP2 embeddings (FSDiT)
-
-Architecture: PatchEmbed → N × DiTBlock(adaLN-Zero) → FinalLayer → unpatchify
-Conditioning: c = TimestepEmbed(t) + SupportProjector(siglip_embed)
+EXP BRANCH: exp/cls-cross-attn
+  - CLS token prepended to patch tokens
+  - Cross-attention: only CLS queries support context
+  - Info flows CLS → patches through self-attention
+  - adaLN: c = LN(t_emb) + cond_scale * LN(y_emb)
 """
 
 import math
@@ -214,7 +213,13 @@ class OneLayerPerceiver(nn.Module):
 
 
 class DiTBlock(nn.Module):
-    """adaLN-Zero DiT block. Always uses manual QKV attention (single param set)."""
+    """adaLN-Zero DiT block with CLS-only cross-attention.
+
+    Self-attention operates on [CLS, patch_tokens]. Cross-attention only uses
+    the CLS token (index 0) as query against support context, then writes
+    the result back to the CLS position. Patches receive condition info
+    through self-attention with CLS.
+    """
     hidden_size: int
     num_heads: int
     mlp_ratio: float = 4.0
@@ -228,7 +233,7 @@ class DiTBlock(nn.Module):
         shift_a, scale_a, gate_a, shift_m, scale_m, gate_m = jnp.split(
             c_proj, 6, axis=-1)
 
-        # ── Self-Attention (always same params, optionally returns weights) ──
+        # ── Self-Attention on [CLS, patches] ──
         x_norm = modulate(
             nn.LayerNorm(use_bias=False, use_scale=False)(x), shift_a, scale_a
         )
@@ -245,11 +250,12 @@ class DiTBlock(nn.Module):
             self.hidden_size, kernel_init=nn.initializers.xavier_uniform())(attn_out)
         x = x + gate_a[:, None] * attn_out
 
-        # ── Cross-Attention on support context ──
+        # ── CLS-only Cross-Attention on support context ──
         if context is not None:
+            cls_token = x[:, :1]  # (B, 1, D)
             q_c = nn.Dense(
                 self.hidden_size, kernel_init=nn.initializers.xavier_uniform())(
-                nn.LayerNorm(use_bias=False, use_scale=False)(x)
+                nn.LayerNorm(use_bias=False, use_scale=False)(cls_token)
             )
             kv_c = nn.Dense(
                 2 * self.hidden_size, kernel_init=nn.initializers.xavier_uniform())(
@@ -270,7 +276,8 @@ class DiTBlock(nn.Module):
                 self.hidden_size,
                 kernel_init=nn.initializers.zeros,
             )(c_attn_out)
-            x = x + c_attn_out
+            # Write cross-attn result back to CLS position only
+            x = x.at[:, :1].add(c_attn_out)
 
         # ── MLP ──
         x_norm2 = modulate(
@@ -314,10 +321,13 @@ class FinalLayer(nn.Module):
 
 class DiT(nn.Module):
     """
-    Diffusion Transformer.
+    Diffusion Transformer with CLS-token cross-attention.
 
-    When `siglip_dim > 0`: FSDiT mode — conditioned on support-set embeddings.
-    When `siglip_dim == 0`: Original mode — conditioned on class labels.
+    Architecture:
+      1. PatchEmbed → patch tokens
+      2. Prepend learnable CLS token
+      3. N × DiTBlock: self-attn on [CLS, patches]; CLS-only cross-attn with context
+      4. Strip CLS → FinalLayer → unpatchify
     """
     patch_size: int
     hidden_size: int
@@ -353,7 +363,16 @@ class DiT(nn.Module):
         pos = self.param("pos_embed", get_2d_sincos_pos_embed,
                          self.hidden_size, n_patches)
         pos = jax.lax.stop_gradient(pos)
-        x = PatchEmbed(ps, self.hidden_size)(x) + pos
+        x = PatchEmbed(ps, self.hidden_size)(x) + pos  # (B, n_patches, D)
+
+        # ── Prepend CLS token ──
+        cls_token = self.param(
+            "cls_token",
+            nn.initializers.truncated_normal(stddev=0.02),
+            (1, 1, self.hidden_size),
+        )
+        cls_tokens = jnp.broadcast_to(cls_token, (B, 1, self.hidden_size))
+        x = jnp.concatenate([cls_tokens, x], axis=1)  # (B, 1+n_patches, D)
 
         # Timestep embed
         t_emb = TimestepEmbedder(self.hidden_size)(t)
@@ -371,7 +390,6 @@ class DiT(nn.Module):
         # Normalize both to same scale before combining
         t_emb = nn.LayerNorm(name='t_emb_ln')(t_emb)
         y_emb = nn.LayerNorm(name='y_emb_ln')(y_emb)
-        # Learnable scale to boost condition signal (init > 1 to prevent suppression)
         cond_scale = self.param('cond_scale', nn.initializers.constant(2.0), ())
         c = t_emb + cond_scale * y_emb
 
@@ -396,6 +414,7 @@ class DiT(nn.Module):
                 debug["support_pooled_abs_mean"] = jnp.array(0.0, dtype=jnp.float32)
                 debug["support_pooled_l2_mean"] = jnp.array(0.0, dtype=jnp.float32)
 
+        # ── Support context for CLS cross-attention ──
         context = None
         if y_seq is not None:
             context = OneLayerPerceiver(
@@ -433,6 +452,9 @@ class DiT(nn.Module):
                 x_f32 = x.astype(jnp.float32)
                 act_abs.append(jnp.mean(jnp.abs(x_f32)))
                 act_rms.append(jnp.sqrt(jnp.mean(jnp.square(x_f32))))
+
+        # ── Strip CLS token, keep only patch tokens ──
+        x = x[:, 1:]  # (B, n_patches, D)
 
         # Unpatchify
         x = FinalLayer(ps, C_out, self.hidden_size)(x, c)
