@@ -31,7 +31,6 @@ def _read_image(path, image_size):
         img = tf.image.decode_image(img, channels=3, expand_animations=False)
     img = tf.image.resize(img, [image_size, image_size])
     img = tf.cast(img, tf.float32) / 255.0
-    img = (img - 0.5) / 0.5
     return np.asarray(img.numpy(), dtype=np.float32)
 
 
