@@ -1,11 +1,11 @@
 """
 model.py — DiT with CLS-token cross-attention conditioning.
 
-EXP BRANCH: exp/cls-cross-attn
+EXP BRANCH: exp/concat-y-t-emb
   - CLS token prepended to patch tokens
   - Cross-attention: only CLS queries support context
   - Info flows CLS → patches through self-attention
-  - adaLN: c = LN(t_emb) + cond_scale * LN(y_emb)
+  - adaLN: c = concat(LN(y_emb), LN(t_emb))
 """
 
 import math
@@ -390,8 +390,7 @@ class DiT(nn.Module):
         # Normalize both to same scale before combining
         t_emb = nn.LayerNorm(name='t_emb_ln')(t_emb)
         y_emb = nn.LayerNorm(name='y_emb_ln')(y_emb)
-        cond_scale = self.param('cond_scale', nn.initializers.constant(2.0), ())
-        c = t_emb + cond_scale * y_emb
+        c = jnp.concatenate([y_emb, t_emb], axis=-1)
 
         debug = None
         act_abs = []
