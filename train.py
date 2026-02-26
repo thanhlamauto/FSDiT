@@ -461,16 +461,17 @@ def main(_):
         train_iter = iter(train_ds.as_numpy_iterator())
         val_iter = iter(val_ds.as_numpy_iterator())
 
-    # Always create online encoder for self-reconstruction
-    # (encodes target image as its own condition)
-    online_encoder = OnlineSupportEncoder(
-        variant='B/16',
-        image_size=cfg.image_size,
-        cache_items=FLAGS.online_cache_items,
-        batch_size=FLAGS.online_siglip_batch_size,
-        no_pmap=FLAGS.online_siglip_no_pmap,
-        warmup_need_seq=bool(FLAGS.use_support_seq),
-    )
+    online_encoder = None
+    if FLAGS.data_mode == 'online':
+        print("Initializing OnlineSupportEncoder...")
+        online_encoder = OnlineSupportEncoder(
+            variant='B/16',
+            image_size=cfg.image_size,
+            cache_items=FLAGS.online_cache_items,
+            batch_size=FLAGS.online_siglip_batch_size,
+            no_pmap=FLAGS.online_siglip_no_pmap,
+            warmup_need_seq=bool(FLAGS.use_support_seq),
+        )
 
     example = next(train_iter)
     example_img = example['target'][:1]  # (1, 224, 224, 3)
