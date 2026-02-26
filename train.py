@@ -490,7 +490,11 @@ def main(_):
     # ── DiT init ──────────────────────────────────────────────────────────
     rng = jax.random.PRNGKey(FLAGS.seed)
     rng, p_key, d_key = jax.random.split(rng, 3)
-    print(f"Device memory: {jax.local_devices()[0].memory_stats()['bytes_limit'] / 2**30:.1f} GB")
+    mem = jax.local_devices()[0].memory_stats()
+    if mem:
+        print(f"Device memory: {mem['bytes_limit'] / 2**30:.1f} GB")
+    else:
+        print(f"Device: {jax.local_devices()[0].platform} (memory_stats unavailable)")
 
     img_c = example_img.shape[-1]
     img_s = example_img.shape[1]
