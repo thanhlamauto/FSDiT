@@ -739,7 +739,8 @@ def main(_):
         # ── Save ──
         if step % FLAGS.save_interval == 0 and FLAGS.save_dir and jax.process_index() == 0:
             single = flax.jax_utils.unreplicate(trainer)
-            cp = Checkpoint(FLAGS.save_dir, parallel=False)
+            ckpt_path = os.path.join(FLAGS.save_dir, f"ckpt_step_{step:07d}.pkl")
+            cp = Checkpoint(ckpt_path, parallel=False)
             cp.set_model(single)
             cp.save()
             del cp, single

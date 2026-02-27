@@ -52,7 +52,9 @@ class Checkpoint:
             with tf.io.gfile.GFile(filename, 'wb') as f:
                 f.write(content)
         else:
-            os.makedirs(filename, exist_ok=True)
+            dirname = os.path.dirname(filename)
+            if dirname:
+                os.makedirs(dirname, exist_ok=True)
             tmp = filename + '.tmp'
             with open(tmp, 'wb') as f:
                 f.write(content)
@@ -63,9 +65,20 @@ class Checkpoint:
         filename = filename or self._filename
         if 'gs://' in filename:
             import tensorflow as tf
+            # GCS doesn't support easy directory listing here without more code,
+            # so assume filename is exact if gs://
             with tf.io.gfile.GFile(filename, 'rb') as f:
                 data = pickle.loads(f.read())
         else:
+            if os.path.isdir(filename):
+                # Find latest .pkl by timestamp or name
+                pkls = [f for f in os.listdir(filename) if f.endswith('.pkl')]
+                if not pkls:
+                    raise FileNotFoundError(f"No .pkl files found in {filename}")
+                pkls.sort()
+                filename = os.path.join(filename, pkls[-1])
+                print(f"Auto-selected latest checkpoint: {filename}")
+            
             with open(filename, 'rb') as f:
                 data = pickle.loads(f.read())
         age = time.time() - data.get('_timestamp', time.time())
