@@ -52,11 +52,13 @@ class Checkpoint:
             with tf.io.gfile.GFile(filename, 'wb') as f:
                 f.write(content)
         else:
-            os.makedirs(filename, exist_ok=True)
+            dirname = os.path.dirname(filename)
+            if dirname:
+                os.makedirs(dirname, exist_ok=True)
             tmp = filename + '.tmp'
             with open(tmp, 'wb') as f:
                 f.write(content)
-            shutil.move(tmp, filename)
+            os.replace(tmp, filename)
         print('Checkpoint saved.')
 
     def load_as_dict(self, filename=None):
