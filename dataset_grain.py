@@ -216,8 +216,7 @@ def build_grain_dataset(
     def _make_iter(epoch_seed):
         """Build a fresh 1-epoch Grain iterator."""
         ds = grain.MapDataset.source(source)
-        if is_train:
-            ds = ds.shuffle(seed=epoch_seed)
+        ds = ds.shuffle(seed=epoch_seed)
         ds = ds.map(
             DecodeEpisode(
                 image_size=image_size,
