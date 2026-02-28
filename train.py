@@ -98,7 +98,8 @@ flags.DEFINE_integer('max_steps', 200_000, 'Total training steps.')
 flags.DEFINE_integer('num_sets', 100, 'Sets per class (each set = 6 images).')
 flags.DEFINE_integer('debug_overfit', 0, 'Overfit on N samples (0 = off).')
 flags.DEFINE_float('cond_dropout', None, 'Override cond_dropout (CFG dropout rate). Default: 0.1.')
-flags.DEFINE_float('weight_decay', None, 'Override weight_decay. Default: 0.01.')
+flags.DEFINE_float('cond_noise_std', None, 'Override cond_noise_std (noise std for condition). Default: 0.01.')
+flags.DEFINE_float('weight_decay', None, 'Override weight_decay. Default: 0.03.')
 flags.DEFINE_float('lr', None, 'Override peak learning rate. Default: 1e-4.')
 flags.DEFINE_bool('use_support_seq', True, 'Use support sequence context for cross-attention.')
 flags.DEFINE_bool('suppress_diffusers_warnings', True, 'Suppress repeated diffusers Flax deprecation warnings.')
@@ -118,7 +119,7 @@ model_config = ml_collections.ConfigDict({
     'warmup_steps': 5000,    # linear warmup (2.5% of 200k)
     'beta1': 0.9,
     'beta2': 0.99,
-    'weight_decay': 0.01,    # AdamW regularization
+    'weight_decay': 0.03,    # AdamW regularization (increased to reduce overfit)
     'grad_clip': 1.0,        # max gradient norm
     # ── DiT Architecture ──
     'hidden_size': 768,
@@ -130,6 +131,7 @@ model_config = ml_collections.ConfigDict({
     # ── FSDiT Conditioning ──
     'siglip_dim': 768,       # SigLIP2 B/16 output dim
     'cond_dropout': 0.1,     # CFG: zero support 10% of time
+    'cond_noise_std': 0.01,  # add 1% noise to support embedings for diverse conditioning
     # ── Flow Matching ──
     'denoise_steps': 50,     # Euler steps for sampling
     'cfg_scale': 3.0,        # classifier-free guidance scale
@@ -217,6 +219,16 @@ class Trainer(flax.struct.PyTreeNode):
             v_gt = flow_velocity(images, eps)
             sup_pooled = support_pooled.astype(images.dtype)
             sup_seq = support_seq.astype(images.dtype) if self.config.get('use_support_seq', 1) else None
+
+            # Add cond_noise to condition embeddings (CLS & seq) to regularize
+            cond_noise_std = self.config.get('cond_noise_std', 0.01)
+            if cond_noise_std > 0.0:
+                cond_rng, noise_key = jax.random.split(noise_key)
+                sup_pooled = sup_pooled + jax.random.normal(cond_rng, sup_pooled.shape) * cond_noise_std
+                if sup_seq is not None:
+                    cseq_rng, noise_key = jax.random.split(noise_key)
+                    sup_seq = sup_seq + jax.random.normal(cseq_rng, sup_seq.shape) * cond_noise_std
+
             if self.config.get('log_model_debug', 1):
                 v_pred, dbg = self.model(
                     x_t, t, sup_pooled, y_seq=sup_seq, train=True,
@@ -357,6 +369,8 @@ def main(_):
     # CLI overrides for tuning
     if FLAGS.cond_dropout is not None:
         cfg.cond_dropout = FLAGS.cond_dropout
+    if FLAGS.cond_noise_std is not None:
+        cfg.cond_noise_std = FLAGS.cond_noise_std
     if FLAGS.weight_decay is not None:
         cfg.weight_decay = FLAGS.weight_decay
     if FLAGS.lr is not None:

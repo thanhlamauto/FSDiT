@@ -75,11 +75,21 @@ def _interleave_by_class(episodes, num_classes, seed):
 def _decode_target(path, image_size, is_train):
     img = tf.io.read_file(path)
     img = tf.image.decode_jpeg(img, channels=3)
-    img = tf.image.resize(img, [image_size, image_size])
     img = tf.cast(img, tf.float32) / 255.0
-    img = (img - 0.5) / 0.5  # [-1, 1]
     if is_train:
+        # Augmented training: slightly larger resize, random crop, flips, color jitter
+        img = tf.image.resize(img, [int(image_size * 1.1), int(image_size * 1.1)])
+        img = tf.image.random_crop(img, [image_size, image_size, 3])
         img = tf.image.random_flip_left_right(img)
+        img = tf.image.random_brightness(img, max_delta=0.2)
+        img = tf.image.random_contrast(img, lower=0.8, upper=1.2)
+        img = tf.image.random_saturation(img, lower=0.8, upper=1.2)
+        img = tf.clip_by_value(img, 0.0, 1.0)
+    else:
+        # Validation: direct resize
+        img = tf.image.resize(img, [image_size, image_size])
+        
+    img = (img - 0.5) / 0.5  # [-1, 1]
     return img
 
 

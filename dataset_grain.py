@@ -23,16 +23,35 @@ import os
 import grain
 import msgpack
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageEnhance
 
 
 # ─── Image decode (PIL-based, no TF dependency) ──────────────────────────────
 
 def _decode_image(path, image_size, is_train, rng=None):
-    """Read, resize, normalize image. Optionally flip for training."""
+    """Read, resize, normalize image. Optionally augment and flip for training."""
     if isinstance(path, bytes):
         path = path.decode("utf-8")
     img = Image.open(path).convert("RGB")
+    
+    if is_train and rng is not None:
+        # Augmentation 1: Random resized crop
+        if rng.random() < 0.5:
+            scale = rng.uniform(0.8, 1.0)
+            w, h = img.size
+            new_w, new_h = int(w * scale), int(h * scale)
+            left = rng.randint(0, max(0, w - new_w + 1))
+            top = rng.randint(0, max(0, h - new_h + 1))
+            img = img.crop((left, top, left + new_w, top + new_h))
+            
+        # Augmentation 2: Color jitter
+        if rng.random() < 0.5:
+            img = ImageEnhance.Brightness(img).enhance(rng.uniform(0.8, 1.2))
+        if rng.random() < 0.5:
+            img = ImageEnhance.Contrast(img).enhance(rng.uniform(0.8, 1.2))
+        if rng.random() < 0.5:
+            img = ImageEnhance.Color(img).enhance(rng.uniform(0.8, 1.2))
+
     img = img.resize((image_size, image_size), Image.BICUBIC)
     arr = np.asarray(img, dtype=np.float32) / 255.0
     arr = (arr - 0.5) / 0.5  # → [-1, 1]
