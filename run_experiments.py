@@ -2,6 +2,10 @@ import argparse
 import os
 import time
 
+# Prevent CUDA probing issues and memory conflicts on Kaggle TPU
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+
 import jax
 import jax.numpy as jnp
 import numpy as np
