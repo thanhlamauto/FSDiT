@@ -5,7 +5,6 @@ import time
 import jax
 import jax.numpy as jnp
 import numpy as np
-import torch
 import ml_collections
 from PIL import Image
 import matplotlib.pyplot as plt
@@ -25,19 +24,53 @@ def cos_sim(a, b):
     b = b.flatten()
     return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-8)
 
-def setup_siglip():
-    """Load HuggingFace SigLIP2 for encoding both image and text."""
-    from transformers import AutoProcessor, AutoModel
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Loading SigLIP2 on {device}...")
-    processor = AutoProcessor.from_pretrained("google/siglip2-base-patch16-224")
-    model = AutoModel.from_pretrained("google/siglip2-base-patch16-224").to(device).eval()
-    if device.type == "cuda":
-        model = model.half()
-    return processor, model, device
+def setup_siglip_jax():
+    """Setup SigLIP2 JAX via big_vision and HuggingFace AutoTokenizer for txt."""
+    import sys
+    
+    repo = os.environ.get('BIG_VISION_DIR', '/kaggle/working/big_vision')
+    if not os.path.exists(repo):
+        print(f"Cloning big_vision → {repo}")
+        os.system(f'git clone --quiet --branch=main --depth=1 '
+                   f'https://github.com/google-research/big_vision {repo} > /dev/null 2>&1')
+        os.system(f'pip install -q -r {repo}/big_vision/requirements.txt > /dev/null 2>&1')
+    if repo not in sys.path:
+        sys.path.insert(0, repo)
+        
+    import big_vision.models.proj.image_text.two_towers as m
+    from transformers import AutoTokenizer
+    
+    variant = "B/16"
+    res = 224
+    txt_var, patch = variant.split('/')
+    emb_dim = {'B': 768, 'L': 1024, 'So400m': 1152}[txt_var]
 
-@torch.no_grad()
-def encode_images(image_paths_or_pils, processor, model, device):
+    cfg = ml_collections.ConfigDict(dict(
+        image_model='vit',
+        image=dict(pool_type='map', scan=True, variant=variant),
+        text_model='proj.image_text.text_transformer',
+        text=dict(scan=True, variant=txt_var, vocab_size=256_000),
+        out_dim=[None, emb_dim],
+        bias_init=-10,
+    ))
+
+    name = f'siglip2_{txt_var.lower()}{patch}_{res}.npz'
+    ckpt_path = f'/tmp/{name}'
+    if not os.path.exists(ckpt_path):
+        url = f'https://storage.googleapis.com/big_vision/siglip2/{name}'
+        print(f"Downloading {url}")
+        os.system(f'wget -q {url} -O {ckpt_path}')
+
+    print(f"Loading SigLIP2 JAX Checkpoint: {variant} {res}×{res}")
+    model = m.Model(**cfg)
+    params = m.load(None, ckpt_path, cfg)
+    
+    print("Loading HuggingFace AutoTokenizer for text...")
+    tokenizer = AutoTokenizer.from_pretrained("google/siglip2-base-patch16-224")
+    
+    return model, params, tokenizer
+
+def encode_images_jax(image_paths_or_pils, model, params):
     """Encode PIL images or paths to get SigLIP2 patches and pooled CLS."""
     images = []
     for item in image_paths_or_pils:
@@ -46,29 +79,53 @@ def encode_images(image_paths_or_pils, processor, model, device):
         else:
             img = item.convert("RGB")
         img = img.resize((224, 224), Image.BICUBIC)
-        images.append(img)
+        # Normalize to [0, 1] for SigLIP
+        arr = np.asarray(img, dtype=np.float32) / 255.0
+        images.append(arr)
+    images_np = np.stack(images)
+    
+    @jax.jit
+    def encode(x):
+        outputs = model.apply({'params': params}, x, None)
+        leaves = jax.tree.leaves(outputs)
+        seq = None
+        pooled = None
+        bsz = x.shape[0]
+        # Extract features by parsing output tensor shapes
+        for arr in leaves:
+            sh = arr.shape
+            if len(sh) == 2 and sh[0] == bsz and sh[1] == 768:
+                pooled = arr if pooled is None else pooled
+            if len(sh) == 3 and sh[0] == bsz and sh[-1] == 768 and sh[1] == 196:
+                seq = arr if seq is None else seq
+        return seq, pooled
         
-    inputs = processor(images=images, return_tensors="pt")
-    inputs = {k: v.to(device, dtype=torch.float16 if device.type=="cuda" else torch.float32) for k, v in inputs.items()}
-    
-    out = model.vision_model(**inputs)
-    seq = out.last_hidden_state.float().cpu().numpy()
-    pooled = out.pooler_output.float().cpu().numpy()
-    
-    if seq.shape[1] == 197:
-        seq = seq[:, 1:, :] # Drop CLS
-    return seq, pooled
+    seq, pooled = encode(images_np)
+    return np.asarray(seq), np.asarray(pooled)
 
-@torch.no_grad()
-def encode_text(text, processor, model, device):
+def encode_text_jax(text, model, params, tokenizer):
     """Encode text string to get SigLIP2 sequence and pooled tokens."""
-    inputs = processor(text=[text], padding="max_length", return_tensors="pt")
-    inputs = {k: v.to(device) for k, v in inputs.items()}
+    # HF Tokenizer perfectly matches SigLIP2 subword encoding
+    tokens = tokenizer([text], padding="max_length", max_length=64, return_tensors="np")["input_ids"]
+    tokens = tokens.astype(np.int32)
     
-    out = model.text_model(**inputs)
-    seq = out.last_hidden_state.float().cpu().numpy()
-    pooled = out.pooler_output.float().cpu().numpy()
-    return seq, pooled
+    @jax.jit
+    def encode(t):
+        outputs = model.apply({'params': params}, None, t)
+        leaves = jax.tree.leaves(outputs)
+        seq = None
+        pooled = None
+        # Extract features
+        for arr in leaves:
+            sh = arr.shape
+            if len(sh) == 2 and sh[0] == 1 and sh[1] == 768:
+                pooled = arr if pooled is None else pooled
+            if len(sh) == 3 and sh[0] == 1 and sh[-1] == 768 and sh[1] == 64:
+                seq = arr if seq is None else seq
+        return seq, pooled
+        
+    seq, pooled = encode(tokens)
+    return np.asarray(seq), np.asarray(pooled)
 
 def init_fsdit(ckpt_path):
     """Initialize DiT model and load weights."""
@@ -171,7 +228,7 @@ def main():
 
     os.makedirs(args.out, exist_ok=True)
     
-    processor, siglip, device = setup_siglip()
+    siglip_model, siglip_params, txt_tokenizer = setup_siglip_jax()
     trainer, cfg, decode_fn = init_fsdit(args.ckpt)
     
     print("\n" + "="*50)
@@ -185,11 +242,11 @@ def main():
     test_imgs = all_imgs[:5]
     print(f"Using 5 images from {args.img_dir}...")
     
-    seq_5, pool_5 = encode_images(test_imgs, processor, siglip, device)
+    seq_5, pool_5 = encode_images_jax(test_imgs, siglip_model, siglip_params)
     
     # Mean pool the 5 images to form the condition
     mean_pool = np.mean(pool_5, axis=0, keepdims=True) # (1, 768)
-    mean_seq = seq_5.reshape(1, -1, 768)               # (1, 980, 768)
+    mean_seq = seq_5.reshape(1, -1, 768)               # (1, 1080/980, 768)
     
     # Generate
     print("Generating image for Exp 1...")
@@ -202,7 +259,7 @@ def main():
     print(f"Saved generated image to {exp1_path}")
     
     # Encode generated image and compute cosine similarity
-    gen_seq_1, gen_pool_1 = encode_images([exp1_path], processor, siglip, device)
+    gen_seq_1, gen_pool_1 = encode_images_jax([exp1_path], siglip_model, siglip_params)
     sim_1 = cos_sim(gen_pool_1[0], mean_pool[0])
     print(f"==> Cosine Similarity (Gen vs Mean of 5): {sim_1:.4f}")
     
@@ -212,7 +269,7 @@ def main():
     print("="*50)
     print(f"Caption: '{args.caption}'")
     
-    seq_txt, pool_txt = encode_text(args.caption, processor, siglip, device)
+    seq_txt, pool_txt = encode_text_jax(args.caption, siglip_model, siglip_params, txt_tokenizer)
     
     # Generate
     print("Generating image for Exp 2...")
@@ -225,7 +282,7 @@ def main():
     print(f"Saved generated image to {exp2_path}")
     
     # Encode generated image and compute cosine similarity
-    gen_seq_2, gen_pool_2 = encode_images([exp2_path], processor, siglip, device)
+    gen_seq_2, gen_pool_2 = encode_images_jax([exp2_path], siglip_model, siglip_params)
     sim_2 = cos_sim(gen_pool_2[0], pool_txt[0])
     print(f"==> Cosine Similarity (Gen vs Text): {sim_2:.4f}")
     print("="*50 + "\n")
