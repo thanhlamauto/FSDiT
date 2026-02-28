@@ -209,7 +209,7 @@ class Trainer(flax.struct.PyTreeNode):
         new_rng, cond_key, time_key, noise_key = jax.random.split(self.rng, 4)
         num_bins = self.config['num_t_bins']
 
-        def loss_fn(params):
+        def loss_fn(params, noise_key):
             # Sample timesteps
             if self.config['t_sampler'] == 'log-normal':
                 t = jax.nn.sigmoid(jax.random.normal(time_key, (images.shape[0],)))
@@ -268,7 +268,7 @@ class Trainer(flax.struct.PyTreeNode):
                 })
             return loss, info
 
-        grads, info = jax.grad(loss_fn, has_aux=True)(self.model.params)
+        grads, info = jax.grad(loss_fn, has_aux=True)(self.model.params, noise_key)
         grads = jax.lax.pmean(grads, axis_name='data')
         info = jax.lax.pmean(info, axis_name='data')
 
