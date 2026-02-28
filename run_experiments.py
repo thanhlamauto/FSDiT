@@ -9,7 +9,7 @@ import ml_collections
 from PIL import Image
 # FSDiT specific imports
 from train import Trainer, StableVAE, model_config, PRESETS
-from models import DiT
+from model import DiT
 from utils.checkpoint import Checkpoint
 
 import warnings
