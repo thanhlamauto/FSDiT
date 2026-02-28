@@ -218,9 +218,10 @@ class DiTBlock(nn.Module):
     hidden_size: int
     num_heads: int
     mlp_ratio: float = 4.0
+    dropout_rate: float = 0.0
 
     @nn.compact
-    def __call__(self, x, c, context=None, return_attn=False):
+    def __call__(self, x, c, context=None, return_attn=False, deterministic=True):
         # adaLN modulation params
         c_proj = nn.Dense(
             6 * self.hidden_size, kernel_init=nn.initializers.constant(0.)
@@ -243,6 +244,7 @@ class DiTBlock(nn.Module):
             'bhqk,bhkd->bhqd', attn_w, v), 'b h n d -> b n (h d)')
         attn_out = nn.Dense(
             self.hidden_size, kernel_init=nn.initializers.xavier_uniform())(attn_out)
+        attn_out = nn.Dropout(self.dropout_rate, deterministic=deterministic)(attn_out)
         x = x + gate_a[:, None] * attn_out
 
         # ── Cross-Attention on support context ──
@@ -270,6 +272,7 @@ class DiTBlock(nn.Module):
                 self.hidden_size,
                 kernel_init=nn.initializers.zeros,
             )(c_attn_out)
+            c_attn_out = nn.Dropout(self.dropout_rate, deterministic=deterministic)(c_attn_out)
             x = x + c_attn_out
 
         # ── MLP ──
@@ -282,6 +285,7 @@ class DiTBlock(nn.Module):
         h = nn.gelu(h)
         h = nn.Dense(self.hidden_size,
                      kernel_init=nn.initializers.xavier_uniform())(h)
+        h = nn.Dropout(self.dropout_rate, deterministic=deterministic)(h)
         x = x + gate_m[:, None] * h
 
         return (x, attn_w) if return_attn else x
@@ -324,6 +328,7 @@ class DiT(nn.Module):
     depth: int
     num_heads: int
     mlp_ratio: float
+    dropout_rate: float = 0.0
     # Class-label mode
     class_dropout_prob: float = 0.0
     num_classes: int = 0
@@ -422,13 +427,12 @@ class DiT(nn.Module):
         # Transformer blocks
         attn_list = []
         for _ in range(self.depth):
+            block = DiTBlock(self.hidden_size, self.num_heads, self.mlp_ratio, self.dropout_rate)
             if return_attn:
-                x, aw = DiTBlock(self.hidden_size, self.num_heads,
-                                 self.mlp_ratio)(x, c, context=context, return_attn=True)
+                x, aw = block(x, c, context=context, return_attn=True, deterministic=not train)
                 attn_list.append(aw)
             else:
-                x = DiTBlock(self.hidden_size, self.num_heads,
-                             self.mlp_ratio)(x, c, context=context)
+                x = block(x, c, context=context, deterministic=not train)
             if return_debug:
                 x_f32 = x.astype(jnp.float32)
                 act_abs.append(jnp.mean(jnp.abs(x_f32)))

@@ -99,6 +99,7 @@ flags.DEFINE_integer('num_sets', 100, 'Sets per class (each set = 6 images).')
 flags.DEFINE_integer('debug_overfit', 0, 'Overfit on N samples (0 = off).')
 flags.DEFINE_float('cond_dropout', None, 'Override cond_dropout (CFG dropout rate). Default: 0.1.')
 flags.DEFINE_float('cond_noise_std', None, 'Override cond_noise_std (noise std for condition). Default: 0.01.')
+flags.DEFINE_float('dropout_rate', None, 'Override dropout_rate (Transformer layers). Default: 0.1.')
 flags.DEFINE_float('weight_decay', None, 'Override weight_decay. Default: 0.03.')
 flags.DEFINE_float('lr', None, 'Override peak learning rate. Default: 1e-4.')
 flags.DEFINE_bool('use_support_seq', True, 'Use support sequence context for cross-attention.')
@@ -128,6 +129,7 @@ model_config = ml_collections.ConfigDict({
     'num_heads': 12,
     'mlp_ratio': 4,
     'preset': 'big',
+    'dropout_rate': 0.1,     # Layer dropout
     # ── FSDiT Conditioning ──
     'siglip_dim': 768,       # SigLIP2 B/16 output dim
     'cond_dropout': 0.1,     # CFG: zero support 10% of time
@@ -232,12 +234,12 @@ class Trainer(flax.struct.PyTreeNode):
             if self.config.get('log_model_debug', 1):
                 v_pred, dbg = self.model(
                     x_t, t, sup_pooled, y_seq=sup_seq, train=True,
-                    return_debug=True, rngs={'cond_dropout': cond_key}, params=params,
+                    return_debug=True, rngs={'cond_dropout': cond_key, 'dropout': cond_key}, params=params,
                 )
             else:
                 v_pred = self.model(
                     x_t, t, sup_pooled, y_seq=sup_seq, train=True,
-                    rngs={'cond_dropout': cond_key}, params=params,
+                    rngs={'cond_dropout': cond_key, 'dropout': cond_key}, params=params,
                 )
                 dbg = None
             mse = (v_pred - v_gt) ** 2
@@ -369,6 +371,8 @@ def main(_):
     # CLI overrides for tuning
     if FLAGS.cond_dropout is not None:
         cfg.cond_dropout = FLAGS.cond_dropout
+    if FLAGS.dropout_rate is not None:
+        cfg.dropout_rate = FLAGS.dropout_rate
     if FLAGS.cond_noise_std is not None:
         cfg.cond_noise_std = FLAGS.cond_noise_std
     if FLAGS.weight_decay is not None:
@@ -516,6 +520,7 @@ def main(_):
     dit = DiT(
         patch_size=cfg.patch_size, hidden_size=cfg.hidden_size,
         depth=cfg.depth, num_heads=cfg.num_heads, mlp_ratio=cfg.mlp_ratio,
+        dropout_rate=cfg.dropout_rate,
         siglip_dim=cfg.siglip_dim, cond_dropout_prob=cfg.cond_dropout,
     )
     init_kwargs = {}
