@@ -6,6 +6,11 @@ import time
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
+# Hide TPU from TensorFlow to prevent Segfaults when big_vision imports TF
+import tensorflow as tf
+tf.config.set_visible_devices([], "GPU")
+tf.config.set_visible_devices([], "TPU")
+
 import jax
 import jax.numpy as jnp
 import numpy as np
