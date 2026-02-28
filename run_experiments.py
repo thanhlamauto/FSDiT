@@ -10,7 +10,7 @@ from PIL import Image
 import matplotlib.pyplot as plt
 
 # FSDiT specific imports
-import config as _config
+import configs.config as _config
 from models import DiT
 from train import Trainer, StableVAE
 from utils.checkpoint import Checkpoint
