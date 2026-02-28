@@ -11,6 +11,9 @@ import flax
 import numpy as np
 import tensorflow as tf
 from PIL import Image
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 
 # Suppress noisy diffusers/flax deprecation warnings emitted during module import.
 warnings.filterwarnings(
@@ -276,14 +279,29 @@ def main():
     cos_sim = np.dot(gen_pooled, cond_pooled) / (np.linalg.norm(gen_pooled) * np.linalg.norm(cond_pooled))
     print(f"Cosine similarity between generation and condition: {cos_sim:.4f}")
 
-    # 8. Save Image
+    # 8. Save Combined Image Grid
     out_dir = os.path.dirname(args.out_path)
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
 
-    img_pil = Image.fromarray((img_out * 255).astype(np.uint8))
-    img_pil.save(args.out_path)
-    print(f"Generated image saved at {args.out_path}")
+    # Convert original condition images from [0, 1] arrays
+    n_cond = len(batch_imgs)
+    fig, axes = plt.subplots(1, n_cond + 1, figsize=(3 * (n_cond + 1), 3))
+    
+    for i in range(n_cond):
+        axes[i].imshow(batch_imgs[i])
+        axes[i].set_title(f"Condition {i+1}")
+        axes[i].axis("off")
+        
+    axes[-1].imshow(img_out)
+    axes[-1].set_title(f"Generated (Sim: {cos_sim:.3f})")
+    axes[-1].axis("off")
+    
+    plt.tight_layout()
+    plt.savefig(args.out_path, bbox_inches='tight')
+    plt.close()
+
+    print(f"Generated combined image saved at {args.out_path}")
 
 if __name__ == '__main__':
     main()
