@@ -261,7 +261,22 @@ def main():
     img_out = vae_decode(latent[None])[0] # (224, 224, 3) 
     img_out = np.array(jnp.clip(img_out * 0.5 + 0.5, 0, 1))
 
-    # 7. Save Image
+    # 7. Calculate Cosine Similarity
+    print("Computing cosine similarity...")
+    # encode_fn expects a batch, so add a dimension
+    _, gen_pooled = encode_fn(img_out[None])
+    gen_pooled = np.array(gen_pooled)[0] # (768,)
+    
+    # pooled_model was formed as (1, 768), then possibly repeated. 
+    # original condition logic: np.mean(pooled_5, axis=0, keepdims=True)
+    cond_pooled = pooled_model[0].astype(np.float32) # (768,)
+    gen_pooled = gen_pooled.astype(np.float32)
+    
+    # Cosine similarity
+    cos_sim = np.dot(gen_pooled, cond_pooled) / (np.linalg.norm(gen_pooled) * np.linalg.norm(cond_pooled))
+    print(f"Cosine similarity between generation and condition: {cos_sim:.4f}")
+
+    # 8. Save Image
     out_dir = os.path.dirname(args.out_path)
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
