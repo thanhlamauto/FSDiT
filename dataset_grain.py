@@ -218,9 +218,9 @@ def build_grain_dataset(
         if is_train:
             ds = ds.shuffle(seed=epoch_seed)
         else:
-            # Light shuffle so validation batches contain mixed classes
+            # Shuffle validation set with fixed seed to mix classes
             # (fixes metrics like diff_class_cos_mean being 0)
-            ds = ds.shuffle(seed=epoch_seed, window_size=2000)
+            ds = ds.shuffle(seed=seed)
         ds = ds.map(
             DecodeEpisode(
                 image_size=image_size,
