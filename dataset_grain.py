@@ -217,6 +217,10 @@ def build_grain_dataset(
         ds = grain.MapDataset.source(source)
         if is_train:
             ds = ds.shuffle(seed=epoch_seed)
+        else:
+            # Light shuffle so validation batches contain mixed classes
+            # (fixes metrics like diff_class_cos_mean being 0)
+            ds = ds.shuffle(seed=epoch_seed, window_size=2000)
         ds = ds.map(
             DecodeEpisode(
                 image_size=image_size,
