@@ -1,20 +1,20 @@
 import os
 import random
 import numpy as np
-import jax
-import jax.numpy as jnp
-from PIL import Image
 
 # Set environment variables for Kaggle TPU v5e-8
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
 # Hide TPU from TensorFlow to prevent Segfaults when big_vision imports TF
+# MUST BE DONE BEFORE IMPORTING JAX
 import tensorflow as tf
 tf.config.set_visible_devices([], "GPU")
 tf.config.set_visible_devices([], "TPU")
 
-
+import jax
+import jax.numpy as jnp
+from PIL import Image
 # Import from the existing repository
 from run_experiments import setup_siglip_jax, encode_images_jax, init_fsdit, generate_sample
 
