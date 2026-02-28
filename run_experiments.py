@@ -7,12 +7,9 @@ import jax.numpy as jnp
 import numpy as np
 import ml_collections
 from PIL import Image
-import matplotlib.pyplot as plt
-
 # FSDiT specific imports
-import configs.config as _config
+from train import Trainer, StableVAE, model_config, PRESETS
 from models import DiT
-from train import Trainer, StableVAE
 from utils.checkpoint import Checkpoint
 
 import warnings
@@ -130,8 +127,8 @@ def encode_text_jax(text, model, params, tokenizer):
 def init_fsdit(ckpt_path):
     """Initialize DiT model and load weights."""
     print("Loading FSDiT model...")
-    cfg = _config.get_config().model
-    for k, v in _config.PRESETS[cfg.preset].items():
+    cfg = ml_collections.ConfigDict(model_config)
+    for k, v in PRESETS[cfg.preset].items():
         cfg[k] = v
         
     cfg.use_support_seq = 1
