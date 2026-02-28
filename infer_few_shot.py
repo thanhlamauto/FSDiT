@@ -111,10 +111,11 @@ def load_and_preprocess(path, image_size=224):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    parser = argparse.ArgumentParser(description="5-shot Inference with FSDiT (Kaggle compatible).")
+    parser = argparse.ArgumentParser(description="Few-shot Inference with FSDiT (Kaggle compatible).")
     parser.add_argument('--img_dir', default='/kaggle/input/datasets/arjunashok33/miniimagenet/test', help='Directory with subfolders of images or just images.')
     parser.add_argument('--ckpt_path', default='/kaggle/input/models/lucastnguyen/dit-few-shot/flax/default/1/ckpt_step_0050000.pkl', help='DiT Checkpoint path.')
-    parser.add_argument('--out_path', default='/kaggle/working/output_5shot.png', help='Generated image output array.')
+    parser.add_argument('--out_path', default='/kaggle/working/output_shot.png', help='Generated image output array.')
+    parser.add_argument('--num_shots', type=int, default=5, help='Number of condition images to randomly select.')
     parser.add_argument('--image_size', type=int, default=224)
     parser.add_argument('--variant', default='B/16')
     parser.add_argument('--cfg_scale', type=float, default=3.0)
@@ -139,14 +140,14 @@ def main():
     else:
         print(f"Warning: {args.img_dir} does not exist. Using dummy images for testing.")
 
-    if len(all_imgs) >= 5:
-        chosen = random.sample(all_imgs, 5)
+    if len(all_imgs) >= args.num_shots:
+        chosen = random.sample(all_imgs, args.num_shots)
     elif len(all_imgs) > 0:
-        chosen = all_imgs * (5 // len(all_imgs) + 1)
-        chosen = chosen[:5]
+        chosen = all_imgs * (args.num_shots // len(all_imgs) + 1)
+        chosen = chosen[:args.num_shots]
     else:
-        print("No images found! Creating 5 dummy images.")
-        chosen = [None] * 5
+        print(f"No images found! Creating {args.num_shots} dummy images.")
+        chosen = [None] * args.num_shots
 
     batch_imgs = []
     for p in chosen:
