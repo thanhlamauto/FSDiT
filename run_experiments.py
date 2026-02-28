@@ -34,7 +34,6 @@ def setup_siglip_jax():
         print(f"Cloning big_vision → {repo}")
         os.system(f'git clone --quiet --branch=main --depth=1 '
                    f'https://github.com/google-research/big_vision {repo} > /dev/null 2>&1')
-        os.system(f'pip install -q -r {repo}/big_vision/requirements.txt > /dev/null 2>&1')
     if repo not in sys.path:
         sys.path.insert(0, repo)
         
