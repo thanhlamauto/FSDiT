@@ -1,5 +1,10 @@
 import argparse
 import os
+
+# Prevent CUDA probing issues and memory conflicts on Kaggle TPU
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+
 import sys
 import time
 import random
