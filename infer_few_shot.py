@@ -72,7 +72,12 @@ def create_siglip2_jax(variant='B/16', res=224):
     print(f"Loading SigLIP2 {variant} {res}×{res}")
     model = m.Model(**cfg)
     params = m.load(None, ckpt_path, cfg)
-    return model, params, emb_dim
+    
+    from transformers import AutoTokenizer
+    print("Loading HuggingFace AutoTokenizer for text...")
+    tokenizer = AutoTokenizer.from_pretrained("google/siglip2-base-patch16-224")
+    
+    return model, params, emb_dim, tokenizer
 
 def make_encode_fn(model, params, emb_dim):
     """Create JIT-compiled encode function returning (seq, pooled)."""
@@ -96,6 +101,30 @@ def make_encode_fn(model, params, emb_dim):
         return jax.lax.stop_gradient(seq), jax.lax.stop_gradient(pooled)
     return encode_batch
 
+def make_encode_txt_fn(model, params, emb_dim, tokenizer):
+    """Create JIT-compiled encode function returning text (seq, pooled)."""
+    @jax.jit
+    def encode(t):
+        outputs = model.apply({'params': params}, None, t)
+        leaves = jax.tree.leaves(outputs)
+        seq = None
+        pooled = None
+        for arr in leaves:
+            sh = arr.shape
+            if len(sh) == 2 and sh[0] == 1 and sh[1] == emb_dim:
+                pooled = arr if pooled is None else pooled
+            if len(sh) == 3 and sh[0] == 1 and sh[-1] == emb_dim and sh[1] == 64:
+                seq = arr if seq is None else seq
+        return jax.lax.stop_gradient(seq), jax.lax.stop_gradient(pooled)
+
+    def encode_text(text):
+        tokens = tokenizer([text], padding="max_length", max_length=64, return_tensors="np")["input_ids"]
+        tokens = tokens.astype(np.int32)
+        seq, pooled = encode(tokens)
+        return np.asarray(seq), np.asarray(pooled)
+
+    return encode_text
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Image loading
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -115,6 +144,7 @@ def load_and_preprocess(path, image_size=224):
 
 def main():
     parser = argparse.ArgumentParser(description="Few-shot Inference with FSDiT (Kaggle compatible).")
+    parser.add_argument('--text', type=str, default=None, help='Text prompt for condition. If provided, overrides image condition.')
     parser.add_argument('--img_dir', default='/kaggle/input/datasets/arjunashok33/miniimagenet/test', help='Directory with subfolders of images or just images.')
     parser.add_argument('--ckpt_path', default='/kaggle/input/models/lucastnguyen/dit-few-shot/flax/default/1/ckpt_step_0050000.pkl', help='DiT Checkpoint path.')
     parser.add_argument('--out_path', default='/kaggle/working/output_shot.png', help='Generated image output array.')
@@ -130,11 +160,22 @@ def main():
     print(f"JAX devices: {jax.devices()}")
 
     # 1. Initialize SigLIP2
-    sig_model, sig_params, emb_dim = create_siglip2_jax(args.variant, args.image_size)
+    sig_model, sig_params, emb_dim, tokenizer = create_siglip2_jax(args.variant, args.image_size)
     encode_fn = make_encode_fn(sig_model, sig_params, emb_dim)
+    encode_txt_fn = make_encode_txt_fn(sig_model, sig_params, emb_dim, tokenizer)
 
-    # 2. Pick 5 random images
-    all_imgs = []
+    batch_imgs = []
+    
+    if args.text is not None:
+        print(f"Using Text Condition: '{args.text}'")
+        seq_model, pooled_model = encode_txt_fn(args.text)
+        # shape expected: sequence (1, context_len, dim), pooled (1, dim)
+        pooled_model = pooled_model.astype(np.float16)
+        seq_model = seq_model.astype(np.float16)
+        n_cond = 0
+    else:
+        # 2. Pick random images for Image Condition
+        all_imgs = []
     if os.path.exists(args.img_dir):
         for root, dirs, files in os.walk(args.img_dir):
             for f in files:
@@ -152,25 +193,26 @@ def main():
         print(f"No images found! Creating {args.num_shots} dummy images.")
         chosen = [None] * args.num_shots
 
-    batch_imgs = []
-    for p in chosen:
-        if p is not None:
-            batch_imgs.append(load_and_preprocess(p, args.image_size))
-        else:
-            batch_imgs.append(np.zeros((args.image_size, args.image_size, 3), dtype=np.float32))
-    
-    batch_imgs = np.stack(batch_imgs)
-    
-    # 3. Encode via SigLIP and Pool
-    # We pass 5 images at once
-    seq_5, pooled_5 = encode_fn(batch_imgs)
-    
-    # Meaning them across the 5 shots
-    pooled_model = np.mean(pooled_5, axis=0, keepdims=True).astype(np.float16)  # (1, 768)
-    # The DiT model expects sequence embeddings to be concatenated: (1, 5 * 196, 768)
-    # So we flatten the first dim and reshape
-    seq_5 = np.array(seq_5)  # (5, 196, 768)
-    seq_model = seq_5.reshape(1, -1, seq_5.shape[-1]).astype(np.float16)  # (1, 980, 768)
+        batch_imgs = []
+        for p in chosen:
+            if p is not None:
+                batch_imgs.append(load_and_preprocess(p, args.image_size))
+            else:
+                batch_imgs.append(np.zeros((args.image_size, args.image_size, 3), dtype=np.float32))
+        
+        batch_imgs = np.stack(batch_imgs)
+        n_cond = len(batch_imgs)
+        
+        # 3. Encode via SigLIP and Pool
+        # We pass 5 images at once
+        seq_5, pooled_5 = encode_fn(batch_imgs)
+        
+        # Meaning them across the 5 shots
+        pooled_model = np.mean(pooled_5, axis=0, keepdims=True).astype(np.float16)  # (1, 768)
+        # The DiT model expects sequence embeddings to be concatenated: (1, 5 * 196, 768)
+        # So we flatten the first dim and reshape
+        seq_5 = np.array(seq_5)  # (5, 196, 768)
+        seq_model = seq_5.reshape(1, -1, seq_5.shape[-1]).astype(np.float16)  # (1, 980, 768)
 
     print(f"Computed Condition. Pooled: {pooled_model.shape}, Seq: {seq_model.shape}")
 
@@ -279,24 +321,29 @@ def main():
     cos_sim = np.dot(gen_pooled, cond_pooled) / (np.linalg.norm(gen_pooled) * np.linalg.norm(cond_pooled))
     print(f"Cosine similarity between generation and condition: {cos_sim:.4f}")
 
-    # 8. Save Combined Image Grid
+    # 8. Save Combined Image Grid / Title Image
     out_dir = os.path.dirname(args.out_path)
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
 
-    # Convert original condition images from [0, 1] arrays
-    n_cond = len(batch_imgs)
-    fig, axes = plt.subplots(1, n_cond + 1, figsize=(3 * (n_cond + 1), 3))
-    
-    for i in range(n_cond):
-        axes[i].imshow(batch_imgs[i])
-        axes[i].set_title(f"Condition {i+1}")
-        axes[i].axis("off")
+    if args.text is not None:
+        fig, ax = plt.subplots(1, 1, figsize=(4, 4))
+        ax.imshow(img_out)
+        ax.set_title(f"Gen (Sim: {cos_sim:.3f})\nPrompt: '{args.text}'")
+        ax.axis("off")
+    else:
+        # Convert original condition images from [0, 1] arrays
+        fig, axes = plt.subplots(1, n_cond + 1, figsize=(3 * (n_cond + 1), 3))
         
-    axes[-1].imshow(img_out)
-    axes[-1].set_title(f"Generated (Sim: {cos_sim:.3f})")
-    axes[-1].axis("off")
-    
+        for i in range(n_cond):
+            axes[i].imshow(batch_imgs[i])
+            axes[i].set_title(f"Condition {i+1}")
+            axes[i].axis("off")
+            
+        axes[-1].imshow(img_out)
+        axes[-1].set_title(f"Generated (Sim: {cos_sim:.3f})")
+        axes[-1].axis("off")
+        
     plt.tight_layout()
     plt.savefig(args.out_path, bbox_inches='tight')
     plt.close()
