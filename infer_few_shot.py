@@ -4,6 +4,9 @@ import os
 # Prevent CUDA probing issues and memory conflicts on Kaggle TPU
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+os.environ["RAY_DEDUP_LOGS"] = "0"
+os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
 import sys
 import time
@@ -79,8 +82,9 @@ def create_siglip2_jax(variant='B/16', res=224):
     params = m.load(None, ckpt_path, cfg)
     
     from transformers import AutoTokenizer
-    print("Loading HuggingFace AutoTokenizer for text...")
-    tokenizer = AutoTokenizer.from_pretrained("google/siglip2-base-patch16-224")
+    print("Loading HuggingFace AutoTokenizer for text (CPU only)...")
+    # Setting use_fast=False sometimes helps prevent backend compiled code from doing weird things
+    tokenizer = AutoTokenizer.from_pretrained("google/siglip2-base-patch16-224", use_fast=False)
     
     return model, params, emb_dim, tokenizer
 
