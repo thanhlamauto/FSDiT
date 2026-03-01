@@ -5,6 +5,9 @@ import time
 # Prevent CUDA probing issues and memory conflicts on Kaggle TPU
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+os.environ["RAY_DEDUP_LOGS"] = "0"
+os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
 import jax
 import jax.numpy as jnp
@@ -65,8 +68,8 @@ def setup_siglip_jax():
     model = m.Model(**cfg)
     params = m.load(None, ckpt_path, cfg)
     
-    print("Loading HuggingFace AutoTokenizer for text...")
-    tokenizer = AutoTokenizer.from_pretrained("google/siglip2-base-patch16-224")
+    print("Loading HuggingFace AutoTokenizer for text (CPU only)...")
+    tokenizer = AutoTokenizer.from_pretrained("google/siglip2-base-patch16-224", use_fast=False)
     
     return model, params, tokenizer
 
