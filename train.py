@@ -179,14 +179,16 @@ def attention_entropy(attn_weights):
     return -jnp.sum(attn_weights * jnp.log(attn_weights + 1e-8), axis=-1).mean(axis=(0, 2))
 
 def compute_t_bin_losses(loss_per_sample, t, num_bins):
-    """Break down MSE loss by timestep bins. Returns (num_bins,) array."""
+    """Break down MSE loss by timestep bins. Returns (num_bins,) array.
+
+    Vectorized: avoids Python loop over bins so XLA traces a single fused op
+    instead of num_bins separate scatter kernels.
+    """
     idx = jnp.clip((t * num_bins).astype(jnp.int32), 0, num_bins - 1)
-    bins = jnp.zeros(num_bins)
-    for b in range(num_bins):
-        mask = (idx == b).astype(jnp.float32)
-        bins = bins.at[b].set(
-            jnp.sum(loss_per_sample * mask) / jnp.maximum(jnp.sum(mask), 1.0))
-    return bins
+    one_hot = jax.nn.one_hot(idx, num_bins)           # (B, num_bins)
+    sum_loss = jnp.dot(loss_per_sample, one_hot)      # (num_bins,)
+    count    = one_hot.sum(axis=0)                    # (num_bins,)
+    return sum_loss / jnp.maximum(count, 1.0)
 
 
 
@@ -203,7 +205,7 @@ class Trainer(flax.struct.PyTreeNode):
     config: dict = flax.struct.field(pytree_node=False)
 
     # ── Training step ──────────────────────────────────────────────────────
-    @partial(jax.pmap, axis_name='data')
+    @partial(jax.pmap, axis_name='data', donate_argnums=(1, 2, 3))
     def train_step(self, images, support_pooled, support_seq):
         """One training step. Returns (new_trainer, info_dict)."""
         new_rng, cond_key, time_key, noise_key = jax.random.split(self.rng, 4)
@@ -222,14 +224,14 @@ class Trainer(flax.struct.PyTreeNode):
             sup_pooled = support_pooled.astype(images.dtype)
             sup_seq = support_seq.astype(images.dtype) if self.config.get('use_support_seq', 1) else None
 
-            # Add cond_noise to condition embeddings (CLS & seq) to regularize
+            # Add cond_noise to condition embeddings (CLS & seq) to regularize.
+            # Use a single 3-way split to avoid two nested splits per step.
             cond_noise_std = self.config.get('cond_noise_std', 0.01)
             if cond_noise_std > 0.0:
-                cond_rng, noise_key = jax.random.split(noise_key)
-                sup_pooled = sup_pooled + jax.random.normal(cond_rng, sup_pooled.shape) * cond_noise_std
+                pool_key, seq_key, noise_key = jax.random.split(noise_key, 3)
+                sup_pooled = sup_pooled + jax.random.normal(pool_key, sup_pooled.shape) * cond_noise_std
                 if sup_seq is not None:
-                    cseq_rng, noise_key = jax.random.split(noise_key)
-                    sup_seq = sup_seq + jax.random.normal(cseq_rng, sup_seq.shape) * cond_noise_std
+                    sup_seq = sup_seq + jax.random.normal(seq_key, sup_seq.shape) * cond_noise_std
 
             if self.config.get('log_model_debug', 1):
                 v_pred, dbg = self.model(

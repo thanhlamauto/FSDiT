@@ -29,21 +29,30 @@ from PIL import Image, ImageEnhance
 # ─── Image decode (PIL-based, no TF dependency) ──────────────────────────────
 
 def _decode_image(path, image_size, is_train, rng=None):
-    """Read, resize, normalize image. Optionally augment and flip for training."""
+    """Read, resize, normalize image. Optionally augment and flip for training.
+
+    Optimization: pre-resize to (image_size + 32) before augmentation so that
+    crop / color-jitter ops work on a smaller pixel grid, then do a single
+    final BICUBIC resize to the exact target size.
+    """
     if isinstance(path, bytes):
         path = path.decode("utf-8")
     img = Image.open(path).convert("RGB")
-    
+
     if is_train and rng is not None:
+        # Pre-resize to a slightly larger size before augmentation to cut pixel ops.
+        pre_size = image_size + 32
+        img = img.resize((pre_size, pre_size), Image.BILINEAR)
+
         # Augmentation 1: Random resized crop
         if rng.random() < 0.5:
-            scale = rng.uniform(0.8, 1.0)
             w, h = img.size
+            scale = rng.uniform(0.8, 1.0)
             new_w, new_h = int(w * scale), int(h * scale)
             left = rng.randint(0, max(0, w - new_w + 1))
-            top = rng.randint(0, max(0, h - new_h + 1))
+            top  = rng.randint(0, max(0, h - new_h + 1))
             img = img.crop((left, top, left + new_w, top + new_h))
-            
+
         # Augmentation 2: Color jitter
         if rng.random() < 0.5:
             img = ImageEnhance.Brightness(img).enhance(rng.uniform(0.8, 1.2))
@@ -52,6 +61,7 @@ def _decode_image(path, image_size, is_train, rng=None):
         if rng.random() < 0.5:
             img = ImageEnhance.Color(img).enhance(rng.uniform(0.8, 1.2))
 
+    # Final resize to exact target size (BICUBIC for quality).
     img = img.resize((image_size, image_size), Image.BICUBIC)
     arr = np.asarray(img, dtype=np.float32) / 255.0
     arr = (arr - 0.5) / 0.5  # → [-1, 1]
@@ -198,8 +208,9 @@ def build_grain_dataset(
     seed=42,
     load_support_seq=True,
     path_prefix_remaps=None,
-    num_threads=16,
-    prefetch_buffer_size=500,
+    num_threads=64,            # TPU v5e-8 Kaggle node has ~96 vCPUs; 64 threads
+                               # saturates them without over-subscribing.
+    prefetch_buffer_size=1000, # Larger buffer amortises Python/GIL stalls.
 ):
     """
     Build a Grain dataset pipeline from ArrayRecord file(s).
