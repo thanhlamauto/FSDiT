@@ -52,8 +52,14 @@ def setup_big_vision():
     if repo not in sys.path:
         sys.path.insert(0, repo)
 
-def create_siglip2_jax(variant='B/16', res=224):
-    """Create SigLIP2 JAX model and load weights."""
+def create_siglip2_jax(variant='B/16', res=224, load_tokenizer=False):
+    """Create SigLIP2 JAX model and load weights.
+    
+    Args:
+        load_tokenizer: Only load HuggingFace tokenizer when needed (i.e. --text mode).
+                        Loading it unconditionally triggers TF/protobuf init that
+                        conflicts with the TPU runtime → SIGSEGV.
+    """
     setup_big_vision()
     import big_vision.models.proj.image_text.two_towers as m
     import ml_collections
@@ -80,12 +86,13 @@ def create_siglip2_jax(variant='B/16', res=224):
     print(f"Loading SigLIP2 {variant} {res}×{res}")
     model = m.Model(**cfg)
     params = m.load(None, ckpt_path, cfg)
-    
-    from transformers import AutoTokenizer
-    print("Loading HuggingFace AutoTokenizer for text (CPU only)...")
-    # Setting use_fast=False sometimes helps prevent backend compiled code from doing weird things
-    tokenizer = AutoTokenizer.from_pretrained("google/siglip2-base-patch16-224", use_fast=False)
-    
+
+    tokenizer = None
+    if load_tokenizer:
+        from transformers import AutoTokenizer
+        print("Loading HuggingFace AutoTokenizer for text (CPU only)...")
+        tokenizer = AutoTokenizer.from_pretrained("google/siglip2-base-patch16-224", use_fast=False)
+
     return model, params, emb_dim, tokenizer
 
 def make_encode_fn(model, params, emb_dim):
@@ -169,38 +176,43 @@ def main():
     print(f"JAX devices: {jax.devices()}")
 
     # 1. Initialize SigLIP2
-    sig_model, sig_params, emb_dim, tokenizer = create_siglip2_jax(args.variant, args.image_size)
+    # Only load tokenizer when --text is provided to avoid TF/protobuf SIGSEGV
+    sig_model, sig_params, emb_dim, tokenizer = create_siglip2_jax(
+        args.variant, args.image_size, load_tokenizer=(args.text is not None)
+    )
     encode_fn = make_encode_fn(sig_model, sig_params, emb_dim)
-    encode_txt_fn = make_encode_txt_fn(sig_model, sig_params, emb_dim, tokenizer)
 
     batch_imgs = []
-    
+
     if args.text is not None:
+        # ── Text conditioning path ──────────────────────────────────────────
         print(f"Using Text Condition: '{args.text}'")
+        encode_txt_fn = make_encode_txt_fn(sig_model, sig_params, emb_dim, tokenizer)
         seq_model, pooled_model = encode_txt_fn(args.text)
-        # shape expected: sequence (1, context_len, dim), pooled (1, dim)
+        # shape: sequence (1, context_len, dim), pooled (1, dim)
         pooled_model = pooled_model.astype(np.float16)
         seq_model = seq_model.astype(np.float16)
         n_cond = 0
     else:
-        # 2. Pick random images for Image Condition
+        # ── Image conditioning path ─────────────────────────────────────────
+        # 2. Pick random images
         all_imgs = []
-    if os.path.exists(args.img_dir):
-        for root, dirs, files in os.walk(args.img_dir):
-            for f in files:
-                if os.path.splitext(f)[1] in IMAGE_EXTS:
-                    all_imgs.append(os.path.join(root, f))
-    else:
-        print(f"Warning: {args.img_dir} does not exist. Using dummy images for testing.")
+        if os.path.exists(args.img_dir):
+            for root, dirs, files in os.walk(args.img_dir):
+                for f in files:
+                    if os.path.splitext(f)[1] in IMAGE_EXTS:
+                        all_imgs.append(os.path.join(root, f))
+        else:
+            print(f"Warning: {args.img_dir} does not exist. Using dummy images for testing.")
 
-    if len(all_imgs) >= args.num_shots:
-        chosen = random.sample(all_imgs, args.num_shots)
-    elif len(all_imgs) > 0:
-        chosen = all_imgs * (args.num_shots // len(all_imgs) + 1)
-        chosen = chosen[:args.num_shots]
-    else:
-        print(f"No images found! Creating {args.num_shots} dummy images.")
-        chosen = [None] * args.num_shots
+        if len(all_imgs) >= args.num_shots:
+            chosen = random.sample(all_imgs, args.num_shots)
+        elif len(all_imgs) > 0:
+            chosen = all_imgs * (args.num_shots // len(all_imgs) + 1)
+            chosen = chosen[:args.num_shots]
+        else:
+            print(f"No images found! Creating {args.num_shots} dummy images.")
+            chosen = [None] * args.num_shots
 
         batch_imgs = []
         for p in chosen:
@@ -208,20 +220,18 @@ def main():
                 batch_imgs.append(load_and_preprocess(p, args.image_size))
             else:
                 batch_imgs.append(np.zeros((args.image_size, args.image_size, 3), dtype=np.float32))
-        
+
         batch_imgs = np.stack(batch_imgs)
         n_cond = len(batch_imgs)
-        
-        # 3. Encode via SigLIP and Pool
-        # We pass 5 images at once
+
+        # 3. Encode via SigLIP and pool
         seq_5, pooled_5 = encode_fn(batch_imgs)
-        
-        # Meaning them across the 5 shots
-        pooled_model = np.mean(pooled_5, axis=0, keepdims=True).astype(np.float16)  # (1, 768)
-        # The DiT model expects sequence embeddings to be concatenated: (1, 5 * 196, 768)
-        # So we flatten the first dim and reshape
-        seq_5 = np.array(seq_5)  # (5, 196, 768)
-        seq_model = seq_5.reshape(1, -1, seq_5.shape[-1]).astype(np.float16)  # (1, 980, 768)
+
+        # Average pooled across shots: (1, 768)
+        pooled_model = np.mean(pooled_5, axis=0, keepdims=True).astype(np.float16)
+        # Concatenate sequence embeddings: (1, num_shots * 196, 768)
+        seq_5 = np.array(seq_5)  # (num_shots, 196, 768)
+        seq_model = seq_5.reshape(1, -1, seq_5.shape[-1]).astype(np.float16)
 
     print(f"Computed Condition. Pooled: {pooled_model.shape}, Seq: {seq_model.shape}")
 
