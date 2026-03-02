@@ -7,6 +7,8 @@ os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["RAY_DEDUP_LOGS"] = "0"
 os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
+# Stop TF from registering TPU/GPU devices — must be set before tensorflow is imported
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
 import sys
 import time
@@ -18,6 +20,9 @@ import jax.numpy as jnp
 import flax
 import numpy as np
 import tensorflow as tf
+# Prevent TF from claiming TPU/GPU; avoids protobuf conflict with JAX TPU runtime
+tf.config.set_visible_devices([], "GPU")
+tf.config.set_visible_devices([], "TPU")
 from PIL import Image
 import matplotlib
 matplotlib.use('Agg')
@@ -48,7 +53,11 @@ def setup_big_vision():
         print(f"Cloning big_vision → {repo}")
         os.system(f'git clone --quiet --branch=main --depth=1 '
                   f'https://github.com/google-research/big_vision {repo} > /dev/null 2>&1')
-        os.system(f'pip install -q -r {repo}/big_vision/requirements.txt > /dev/null 2>&1')
+        # NOTE: Do NOT run `pip install -r requirements.txt` here.
+        # Kaggle TPU already ships TF/JAX packages that are mutually compatible.
+        # Installing big_vision's requirements would pull in a *different* TF wheel
+        # with an incompatible protobuf .so that conflicts with JAX TPU's built-in
+        # protobuf at dynamic-link time → SIGSEGV in AddDescriptors().
     if repo not in sys.path:
         sys.path.insert(0, repo)
 

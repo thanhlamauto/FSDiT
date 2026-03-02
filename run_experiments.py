@@ -8,6 +8,8 @@ os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["RAY_DEDUP_LOGS"] = "0"
 os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
+# Stop TF from registering TPU/GPU devices — must be set before tensorflow is imported
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
 import jax
 import jax.numpy as jnp
@@ -37,8 +39,15 @@ def setup_siglip_jax():
         print(f"Cloning big_vision → {repo}")
         os.system(f'git clone --quiet --branch=main --depth=1 '
                    f'https://github.com/google-research/big_vision {repo} > /dev/null 2>&1')
+        # NOTE: Do NOT pip install requirements.txt — it overwrites Kaggle's
+        # TF with a version that has an incompatible protobuf binary → SIGSEGV.
     if repo not in sys.path:
         sys.path.insert(0, repo)
+
+    import tensorflow as tf
+    # Prevent TF from claiming TPU/GPU; avoids protobuf conflict with JAX TPU runtime
+    tf.config.set_visible_devices([], "GPU")
+    tf.config.set_visible_devices([], "TPU")
         
     import big_vision.models.proj.image_text.two_towers as m
     from transformers import AutoTokenizer
