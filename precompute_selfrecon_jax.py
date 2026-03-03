@@ -25,11 +25,23 @@ Record schema (msgpack):
 Designed for Kaggle TPU v5e-8.
 
 Usage:
-    # Self-recon, SigLIP2
+    # Self-recon, SigLIP2 — process both splits at once
     python precompute_selfrecon_jax.py \
         --data_dir /kaggle/working/miniimagenet_split \
         --out_dir /kaggle/working/precomp_k0 \
         --splits train,val --batch_size 64
+
+    # Process only the train split (to stay within Kaggle's 20 GB limit)
+    python precompute_selfrecon_jax.py \
+        --data_dir /kaggle/working/miniimagenet_vanilla \
+        --out_dir /kaggle/working/precomp_k5_dinov2 \
+        --split train --batch_size 64 --encoder dinov2 --k 0
+
+    # Then run a separate session for the test split
+    python precompute_selfrecon_jax.py \
+        --data_dir /kaggle/working/miniimagenet_vanilla \
+        --out_dir /kaggle/working/precomp_k5_dinov2 \
+        --split test --batch_size 64 --encoder dinov2 --k 0
 
     # 5-shot, DINOv2, no patch tokens
     python precompute_selfrecon_jax.py \
@@ -403,7 +415,12 @@ def main():
     parser.add_argument('--out_dir', required=True,
                         help='Output directory for ArrayRecord files.')
     parser.add_argument('--splits', default='train,val',
-                        help='Comma-separated splits to process.')
+                        help='Comma-separated splits to process (e.g. "train,val,test").')
+    parser.add_argument('--split', default=None,
+                        help='Single split to process (e.g. "train" or "test"). '
+                             'Overrides --splits when provided. '
+                             'Useful on Kaggle to stay within the 20 GB output limit '
+                             'by running train and test in separate sessions.')
     parser.add_argument('--batch_size', type=int, default=64,
                         help='Encoding batch size.')
     parser.add_argument('--image_size', type=int, default=224,
@@ -430,6 +447,10 @@ def main():
              'Use --no-keep_patches to save space when only CLS is needed.',
     )
     args = parser.parse_args()
+
+    # --split (singular) overrides --splits
+    if args.split is not None:
+        args.splits = args.split
 
     print(f"JAX devices: {jax.devices()}")
     print(f"Num devices: {jax.device_count()}")
