@@ -38,7 +38,7 @@ warnings.filterwarnings(
 os.environ.setdefault("DIFFUSERS_VERBOSITY", "error")
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 
-from model import DiT
+from model import GramDiT
 from dataset import build_dataset
 from utils.train_state import TrainState, target_update
 from utils.checkpoint import Checkpoint
@@ -100,7 +100,9 @@ flags.DEFINE_integer('debug_overfit', 0, 'Overfit on N samples (0 = off).')
 flags.DEFINE_float('cond_dropout', None, 'Override cond_dropout (CFG dropout rate). Default: 0.1.')
 flags.DEFINE_float('weight_decay', None, 'Override weight_decay. Default: 0.01.')
 flags.DEFINE_float('lr', None, 'Override peak learning rate. Default: 1e-4.')
-flags.DEFINE_bool('use_support_seq', True, 'Use support sequence context for cross-attention.')
+flags.DEFINE_bool('use_support_seq', False, 'Unused in gram-adaln (no cross-attn). Kept for data pipeline backward compat.')
+flags.DEFINE_integer('gram_rank_s', 32, 'Self-gram low-rank dimension (0 = disabled).')
+flags.DEFINE_integer('gram_rank_c', 32, 'Cross-gram low-rank dimension (0 = disabled).')
 flags.DEFINE_bool('suppress_diffusers_warnings', True, 'Suppress repeated diffusers Flax deprecation warnings.')
 flags.DEFINE_bool('log_model_debug', True, 'Log model activation/condition debug metrics.')
 # Logging
@@ -120,7 +122,7 @@ model_config = ml_collections.ConfigDict({
     'beta2': 0.99,
     'weight_decay': 0.01,    # AdamW regularization
     'grad_clip': 1.0,        # max gradient norm
-    # ── DiT Architecture ──
+    # ── GramDiT Architecture ──
     'hidden_size': 768,
     'patch_size': 2,
     'depth': 12,
@@ -128,8 +130,11 @@ model_config = ml_collections.ConfigDict({
     'mlp_ratio': 4,
     'preset': 'big',
     # ── FSDiT Conditioning ──
-    'siglip_dim': 768,       # SigLIP2 B/16 output dim
+    'siglip_dim': 768,       # CLS token dim (SigLIP2-B/16 or DINOv2-B)
     'cond_dropout': 0.1,     # CFG: zero support 10% of time
+    # ── Gram Ranks ──
+    'gram_rank_s': 32,       # self-gram rank (0 = disabled)
+    'gram_rank_c': 32,       # cross-gram rank (0 = disabled)
     # ── Flow Matching ──
     'denoise_steps': 50,     # Euler steps for sampling
     'cfg_scale': 3.0,        # classifier-free guidance scale
@@ -140,7 +145,6 @@ model_config = ml_collections.ConfigDict({
     'image_size': 224,
     'loss_ema_alpha': 0.99,  # EMA smoothing for logged train loss
     'num_t_bins': 10,        # t-bin resolution for loss breakdown
-    'use_support_seq': 1,    # whether to use support sequence context
     'log_model_debug': 1,    # return model debug tensors during training
 })
 
@@ -201,7 +205,9 @@ class Trainer(flax.struct.PyTreeNode):
     # ── Training step ──────────────────────────────────────────────────────
     @partial(jax.pmap, axis_name='data')
     def train_step(self, images, support_pooled, support_seq):
-        """One training step. Returns (new_trainer, info_dict)."""
+        """One training step. Returns (new_trainer, info_dict).
+        Note: support_seq is accepted for API compatibility but not passed to GramDiT.
+        """
         new_rng, cond_key, time_key, noise_key = jax.random.split(self.rng, 4)
         num_bins = self.config['num_t_bins']
 
@@ -216,15 +222,15 @@ class Trainer(flax.struct.PyTreeNode):
             x_t = flow_interpolate(images, eps, t[:, None, None, None])
             v_gt = flow_velocity(images, eps)
             sup_pooled = support_pooled.astype(images.dtype)
-            sup_seq = support_seq.astype(images.dtype) if self.config.get('use_support_seq', 1) else None
+            # GramDiT uses only pooled CLS (no y_seq / context)
             if self.config.get('log_model_debug', 1):
                 v_pred, dbg = self.model(
-                    x_t, t, sup_pooled, y_seq=sup_seq, train=True,
+                    x_t, t, sup_pooled, train=True,
                     return_debug=True, rngs={'cond_dropout': cond_key}, params=params,
                 )
             else:
                 v_pred = self.model(
-                    x_t, t, sup_pooled, y_seq=sup_seq, train=True,
+                    x_t, t, sup_pooled, train=True,
                     rngs={'cond_dropout': cond_key}, params=params,
                 )
                 dbg = None
@@ -276,7 +282,9 @@ class Trainer(flax.struct.PyTreeNode):
     # ── Validation loss ────────────────────────────────────────────────────
     @partial(jax.pmap, axis_name='data')
     def val_loss(self, images, support_pooled, support_seq):
-        """Compute val loss + t-bin breakdown (no dropout, uses EMA model)."""
+        """Compute val loss + t-bin breakdown (no dropout, uses EMA model).
+        Note: support_seq accepted for API compatibility but not passed to GramDiT.
+        """
         time_key, noise_key = jax.random.split(self.rng, 2)
         if self.config['t_sampler'] == 'log-normal':
             t = jax.nn.sigmoid(jax.random.normal(time_key, (images.shape[0],)))
@@ -287,9 +295,8 @@ class Trainer(flax.struct.PyTreeNode):
         x_t = flow_interpolate(images, eps, t[:, None, None, None])
         v_gt = flow_velocity(images, eps)
         sup_pooled = support_pooled.astype(images.dtype)
-        sup_seq = support_seq.astype(images.dtype) if self.config.get('use_support_seq', 1) else None
         v_pred = self.model_ema(
-            x_t, t, sup_pooled, y_seq=sup_seq,
+            x_t, t, sup_pooled,
             train=False, force_drop_ids=False,
         )
         mse = jnp.mean((v_pred - v_gt) ** 2, axis=(1, 2, 3))
@@ -309,10 +316,9 @@ class Trainer(flax.struct.PyTreeNode):
         eps = jax.random.normal(noise_key, images.shape)
         x_t = flow_interpolate(images, eps, t[:, None, None, None])
         sup_pooled = support_pooled.astype(images.dtype)
-        sup_seq = support_seq.astype(images.dtype) if self.config.get('use_support_seq', 1) else None
 
         _, attn_list = self.model_ema(
-            x_t, t, sup_pooled, y_seq=sup_seq,
+            x_t, t, sup_pooled,
             train=False, force_drop_ids=False, return_attn=True,
         )
         entropies = jnp.stack([attention_entropy(aw) for aw in attn_list])  # (depth, H)
@@ -322,24 +328,20 @@ class Trainer(flax.struct.PyTreeNode):
     @partial(jax.pmap, axis_name='data',
              in_axes=(0, 0, 0, 0, 0), static_broadcasted_argnums=(5, 6))
     def sample_step(self, x, t_vec, support_pooled, support_seq, cfg=True, cfg_val=1.0):
-        """One Euler step with optional CFG."""
+        """One Euler step with optional CFG.
+        Note: support_seq accepted for API compatibility but not passed to GramDiT.
+        """
         sup_pooled = support_pooled.astype(x.dtype)
-        use_seq = self.config.get('use_support_seq', 1)
-        sup_seq = support_seq.astype(x.dtype) if use_seq else None
         if not cfg or cfg_val == 0:
             return self.model_ema(
-                x, t_vec, sup_pooled, y_seq=sup_seq,
+                x, t_vec, sup_pooled,
                 train=False, force_drop_ids=False,
             )
         B = x.shape[0]
         x2 = jnp.concatenate([x, x])
         t2 = jnp.concatenate([t_vec, t_vec])
         pooled2 = jnp.concatenate([sup_pooled, jnp.zeros_like(sup_pooled)])
-        if use_seq:
-            seq2 = jnp.concatenate([sup_seq, jnp.zeros_like(sup_seq)])
-        else:
-            seq2 = None
-        v = self.model_ema(x2, t2, pooled2, y_seq=seq2, train=False, force_drop_ids=False)
+        v = self.model_ema(x2, t2, pooled2, train=False, force_drop_ids=False)
         v_c, v_u = v[:B], v[B:]
         return v_u + cfg_val * (v_c - v_u)
 
@@ -352,9 +354,11 @@ def main(_):
     cfg = FLAGS.model
     for k, v in PRESETS[cfg.preset].items():
         cfg[k] = v
-    cfg.use_support_seq = int(FLAGS.use_support_seq)
     cfg.log_model_debug = int(FLAGS.log_model_debug)
-    # CLI overrides for tuning
+    # Gram rank CLI overrides
+    cfg.gram_rank_s = FLAGS.gram_rank_s
+    cfg.gram_rank_c = FLAGS.gram_rank_c
+    # Other CLI overrides for tuning
     if FLAGS.cond_dropout is not None:
         cfg.cond_dropout = FLAGS.cond_dropout
     if FLAGS.weight_decay is not None:
@@ -488,7 +492,7 @@ def main(_):
         vae_encode = jax.pmap(vae.encode)
         vae_decode = jax.jit(vae.decode)
 
-    # ── DiT init ──────────────────────────────────────────────────────────
+    # ── GramDiT init ──────────────────────────────────────────────────────────────────
     rng = jax.random.PRNGKey(FLAGS.seed)
     rng, p_key, d_key = jax.random.split(rng, 3)
     print(f"Device memory: {jax.local_devices()[0].memory_stats()['bytes_limit'] / 2**30:.1f} GB")
@@ -496,23 +500,20 @@ def main(_):
     img_c = example_img.shape[-1]
     img_s = example_img.shape[1]
 
-    dit = DiT(
+    dit = GramDiT(
         patch_size=cfg.patch_size, hidden_size=cfg.hidden_size,
         depth=cfg.depth, num_heads=cfg.num_heads, mlp_ratio=cfg.mlp_ratio,
         siglip_dim=cfg.siglip_dim, cond_dropout_prob=cfg.cond_dropout,
+        gram_rank_s=cfg.gram_rank_s, gram_rank_c=cfg.gram_rank_c,
     )
-    init_kwargs = {}
-    if FLAGS.use_support_seq:
-        init_kwargs['y_seq'] = jnp.zeros((1, n_sup_tokens, cfg.siglip_dim))
     params = dit.init(
         {'params': p_key, 'cond_dropout': d_key},
         jnp.zeros((1, img_s, img_s, img_c)),   # x
         jnp.zeros((1,)),                        # t
-        jnp.zeros((1, cfg.siglip_dim)),         # y_pooled
-        **init_kwargs,
+        jnp.zeros((1, cfg.siglip_dim)),         # y_pooled (CLS token)
     )['params']
     n_params = sum(x.size for x in jax.tree_util.tree_leaves(params))
-    print(f"DiT parameters: {n_params:,}")
+    print(f"GramDiT parameters: {n_params:,} | gram_rank_s={cfg.gram_rank_s}, gram_rank_c={cfg.gram_rank_c}")
 
     # ── Optimizer: warmup → cosine decay + grad clip + AdamW ──────────────
     max_steps = int(FLAGS.max_steps)
@@ -600,13 +601,11 @@ def main(_):
 
         pooled_global = np.mean(pooled_5, axis=1, dtype=np.float32)
         pooled_model = pooled_global.astype(np.float16)
-        if FLAGS.use_support_seq:
-            seq_model = seq_5.reshape(seq_5.shape[0], -1, seq_5.shape[-1]).astype(np.float16)
-        else:
-            seq_model = np.zeros(
-                (batch['target'].shape[0], 1, cfg.siglip_dim),
-                dtype=np.float16,
-            )
+        # GramDiT does not use seq tokens; return a dummy placeholder for API compat
+        seq_model = np.zeros(
+            (batch['target'].shape[0], 1, cfg.siglip_dim),
+            dtype=np.float16,
+        )
         return pooled_global, pooled_model, seq_model, siglip_stats
 
     # ── Eval function ─────────────────────────────────────────────────────

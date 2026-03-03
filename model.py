@@ -1,11 +1,14 @@
 """
-model.py — DiT with CLS-token cross-attention conditioning.
+model.py — DiT variants for FSDiT.
 
-EXP BRANCH: exp/cls-cross-attn
-  - CLS token prepended to patch tokens
-  - Cross-attention: only CLS queries support context
-  - Info flows CLS → patches through self-attention
-  - adaLN: c = LN(t_emb) + cond_scale * LN(y_emb)
+BRANCH: feat/gram-dit-block-adaln
+  - GramDiTBlock: Gram matrix branches (self-gram + cross-gram) + AdaLN conditioning
+  - Cross-attention REMOVED; conditioning via CLS token (SigLIP2/DINOv2) through AdaLN
+  - Self-gram:  X' = RMSNorm(X·(X^T·A_s)·B_s) + Y
+  - Cross-gram: Z  = RMSNorm(X'·(C^T·C_r)·D_r)   [no residual add; C = CLS token]
+  - adaLN: c = LN(t_emb) + cond_scale·LN(MLP(cls_token))
+
+Legacy DiT/DiTBlock kept for backward compatibility.
 """
 
 import math
@@ -145,6 +148,17 @@ def modulate(x, shift, scale):
     return x * (1 + scale[:, None]) + shift[:, None]
 
 
+class RMSNorm(nn.Module):
+    """Root Mean Square Normalisation with learnable per-channel scale."""
+    eps: float = 1e-6
+
+    @nn.compact
+    def __call__(self, x):
+        scale = self.param('scale', nn.initializers.ones, (x.shape[-1],))
+        rms = jnp.sqrt(jnp.mean(jnp.square(x), axis=-1, keepdims=True) + self.eps)
+        return scale * x / rms
+
+
 class PatchEmbed(nn.Module):
     """Conv-based 2D → patch tokens."""
     patch_size: int
@@ -210,6 +224,97 @@ class OneLayerPerceiver(nn.Module):
             kernel_init=nn.initializers.xavier_uniform(),
         )(h)
         return x + h
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Gram DiT Block (feat/gram-dit-block-adaln)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class GramDiTBlock(nn.Module):
+    """Gram-matrix DiT block with AdaLN conditioning.
+
+    Pipeline (no cross-attention):
+      Y  = X + α₁ · MSA(adaLN(X, γ₁, β₁))
+      X' = RMSNorm(X · (X^T·A_s) · B_s) + Y        ← self-gram branch
+      Z  = RMSNorm(X' · (C^T·C_r) · D_r)            ← cross-gram branch (C = CLS token, no residual)
+      out = Z + α₂ · MLP(adaLN(Z, γ₂, β₂))
+
+    The gram branches are zero-init at B_s / D_r so they are identity-skip
+    at the start of training.
+    """
+    hidden_size: int
+    num_heads: int
+    mlp_ratio: float = 4.0
+    gram_rank_s: int = 32   # rank for self-gram
+    gram_rank_c: int = 32   # rank for cross-gram
+
+    @nn.compact
+    def __call__(self, x, c, cls_token, return_attn=False):
+        """
+        Args:
+            x:         (B, N, D)  patch tokens
+            c:         (B, D)     global adaLN conditioning signal
+            cls_token: (B, D)     CLS embedding from SigLIP2/DINOv2 for cross-gram
+        Returns:
+            x: (B, N, D)
+        """
+        D = self.hidden_size
+        r_s = self.gram_rank_s
+        r_c = self.gram_rank_c
+
+        # ── adaLN modulation (6-way projection, zero-init → stable at init) ──
+        c_proj = nn.Dense(
+            6 * D, kernel_init=nn.initializers.constant(0.)
+        )(nn.silu(c))  # (B, 6D)
+        shift_a, scale_a, gate_a, shift_m, scale_m, gate_m = jnp.split(c_proj, 6, axis=-1)
+
+        # ── Self-Attention ──
+        x_norm = modulate(nn.LayerNorm(use_bias=False, use_scale=False)(x), shift_a, scale_a)
+        hd = D // self.num_heads
+        qkv = nn.Dense(3 * D, kernel_init=nn.initializers.xavier_uniform())(x_norm)
+        q, k, v = [rearrange(t, 'b n (h d) -> b h n d', h=self.num_heads)
+                   for t in jnp.split(qkv, 3, axis=-1)]
+        attn_w = jax.nn.softmax(
+            jnp.einsum('bhqd,bhkd->bhqk', q, k) * (hd ** -0.5), axis=-1)
+        attn_out = rearrange(
+            jnp.einsum('bhqk,bhkd->bhqd', attn_w, v), 'b h n d -> b n (h d)')
+        attn_out = nn.Dense(D, kernel_init=nn.initializers.xavier_uniform())(attn_out)
+        Y = x + gate_a[:, None] * attn_out  # (B, N, D)
+
+        # ── Self-Gram Branch: X' = RMSNorm( X · (X^T·A_s) · B_s ) + Y ──
+        if r_s > 0:
+            A_s = self.param('A_s', nn.initializers.truncated_normal(0.02), (D, r_s))
+            B_s = self.param('B_s', nn.initializers.zeros, (r_s, D))
+            # Efficient: avoid N×N gram matrix
+            u_s = jnp.einsum('bnd,dr->bnr', x, A_s)       # (B, N, r_s)
+            gram_s = jnp.einsum('bnr,rd->bnd', u_s, B_s)  # (B, N, D)
+            X_prime = RMSNorm()(gram_s) + Y
+        else:
+            X_prime = Y
+
+        # ── Cross-Gram Branch: Z = RMSNorm( X' · (C^T·C_r) · D_r ) ──
+        # C = cls_token: (B, D) — per-sample, so u_c is per-sample
+        if r_c > 0:
+            C_r = self.param('C_r', nn.initializers.truncated_normal(0.02), (D, r_c))
+            D_r = self.param('D_r', nn.initializers.zeros, (r_c, D))
+            # u_c: per-sample projection matrix  (B, D, r_c)
+            u_c = jnp.einsum('bd,dr->bdr', cls_token, C_r)
+            # v_c: project patch tokens into gram space  (B, N, r_c)
+            v_c = jnp.einsum('bnd,bdr->bnr', X_prime, u_c)
+            gram_c = jnp.einsum('bnr,rd->bnd', v_c, D_r)  # (B, N, D)
+            Z = RMSNorm()(gram_c)                          # no residual add per diagram
+        else:
+            Z = X_prime
+
+        # ── MLP with adaLN ──
+        z_norm = modulate(nn.LayerNorm(use_bias=False, use_scale=False)(Z), shift_m, scale_m)
+        mlp_dim = int(D * self.mlp_ratio)
+        h = nn.Dense(mlp_dim, kernel_init=nn.initializers.xavier_uniform())(z_norm)
+        h = nn.gelu(h)
+        h = nn.Dense(D, kernel_init=nn.initializers.xavier_uniform())(h)
+        out = Z + gate_m[:, None] * h
+
+        return (out, attn_w) if return_attn else out
 
 
 class DiTBlock(nn.Module):
@@ -316,7 +421,151 @@ class FinalLayer(nn.Module):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Full DiT Model
+#  GramDiT Model (feat/gram-dit-block-adaln)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class GramDiT(nn.Module):
+    """
+    Gram-matrix Diffusion Transformer with AdaLN conditioning.
+
+    Architecture:
+      1. PatchEmbed → patch tokens + sincos pos embed
+      2. Conditioning: c = LN(t_emb) + cond_scale·LN(SupportProjector(y_pooled))
+         - y_pooled: mean-pooled CLS token from SigLIP2 or DINOv2 (B, siglip_dim)
+         - cls_token passed raw to each GramDiTBlock for cross-gram branch
+      3. N × GramDiTBlock: self-attn + self-gram + cross-gram (no cross-attn)
+      4. FinalLayer → unpatchify
+
+    No learnable CLS prepend, no y_seq/context pipeline.
+    """
+    patch_size: int
+    hidden_size: int
+    depth: int
+    num_heads: int
+    mlp_ratio: float
+    siglip_dim: int = 768      # CLS token dim (SigLIP2-B/16 or DINOv2-B)
+    cond_dropout_prob: float = 0.1
+    gram_rank_s: int = 32      # self-gram rank
+    gram_rank_c: int = 32      # cross-gram rank
+    learn_sigma: bool = False
+
+    @nn.compact
+    def __call__(
+        self, x, t, y_pooled,
+        train=False, force_drop_ids=None, return_attn=False, return_debug=False
+    ):
+        """
+        Args:
+            x:         (B, H, W, C)      noisy image / latent
+            t:         (B,)              timestep ∈ [0, 1]
+            y_pooled:  (B, siglip_dim)   mean-pooled CLS token from encoder
+            train:     bool
+            force_drop_ids: bool or (B,) int — CFG unconditional
+        """
+        B, S, _, C_in = x.shape
+        C_out = C_in * (2 if self.learn_sigma else 1)
+        ps = self.patch_size
+        n_patches = (S // ps) ** 2
+        n_side = S // ps
+
+        # Patch embed + sincos pos embed
+        pos = self.param("pos_embed", get_2d_sincos_pos_embed,
+                         self.hidden_size, n_patches)
+        pos = jax.lax.stop_gradient(pos)
+        x = PatchEmbed(ps, self.hidden_size)(x) + pos  # (B, N, D)
+
+        # Timestep embed
+        t_emb = TimestepEmbedder(self.hidden_size)(t)  # (B, D)
+
+        # CLS conditioning embed (with CFG dropout)
+        cls_emb = SupportProjector(
+            self.hidden_size, self.siglip_dim, self.cond_dropout_prob
+        )(y_pooled, train=train, force_drop_ids=force_drop_ids)  # (B, D)
+
+        # Keep raw cls_token (before MLP projection) for cross-gram branch.
+        # Apply CFG dropout to raw token the same way.
+        if force_drop_ids is not None:
+            if isinstance(force_drop_ids, bool):
+                cls_token = jnp.zeros_like(y_pooled) if force_drop_ids else y_pooled
+            else:
+                mask = (force_drop_ids == 1)[:, None]
+                cls_token = jnp.where(mask, 0.0, y_pooled)
+        elif train and self.cond_dropout_prob > 0:
+            drop = jax.random.bernoulli(
+                self.make_rng('cond_dropout'), self.cond_dropout_prob, (B,)
+            )
+            cls_token = jnp.where(drop[:, None], 0.0, y_pooled)  # (B, siglip_dim)
+        else:
+            cls_token = y_pooled
+
+        # Project raw cls_token to hidden_size for cross-gram
+        cls_token_proj = nn.Dense(
+            self.hidden_size,
+            kernel_init=nn.initializers.normal(0.02),
+            name='cls_token_proj'
+        )(cls_token)  # (B, D)
+
+        # Global conditioning signal: c = LN(t_emb) + cond_scale * LN(cls_emb)
+        t_emb_n = nn.LayerNorm(name='t_emb_ln')(t_emb)
+        y_emb_n = nn.LayerNorm(name='y_emb_ln')(cls_emb)
+        cond_scale = self.param('cond_scale', nn.initializers.constant(2.0), ())
+        c = t_emb_n + cond_scale * y_emb_n  # (B, D)
+
+        debug = None
+        act_abs = []
+        act_rms = []
+        if return_debug:
+            c_f32 = c.astype(jnp.float32)
+            yp = y_pooled.astype(jnp.float32)
+            debug = {
+                "t_emb_abs_mean": jnp.mean(jnp.abs(t_emb_n.astype(jnp.float32))),
+                "y_emb_abs_mean": jnp.mean(jnp.abs(y_emb_n.astype(jnp.float32))),
+                "c_abs_mean": jnp.mean(jnp.abs(c_f32)),
+                "c_l2_mean": jnp.mean(jnp.linalg.norm(c_f32, axis=-1)),
+                "support_pooled_abs_mean": jnp.mean(jnp.abs(yp)),
+                "support_pooled_l2_mean": jnp.mean(jnp.linalg.norm(yp, axis=-1)),
+            }
+
+        # Transformer blocks
+        attn_list = []
+        for _ in range(self.depth):
+            if return_attn:
+                x, aw = GramDiTBlock(
+                    self.hidden_size, self.num_heads, self.mlp_ratio,
+                    self.gram_rank_s, self.gram_rank_c
+                )(x, c, cls_token_proj, return_attn=True)
+                attn_list.append(aw)
+            else:
+                x = GramDiTBlock(
+                    self.hidden_size, self.num_heads, self.mlp_ratio,
+                    self.gram_rank_s, self.gram_rank_c
+                )(x, c, cls_token_proj)
+            if return_debug:
+                x_f32 = x.astype(jnp.float32)
+                act_abs.append(jnp.mean(jnp.abs(x_f32)))
+                act_rms.append(jnp.sqrt(jnp.mean(jnp.square(x_f32))))
+
+        # Final layer → unpatchify
+        x = FinalLayer(ps, C_out, self.hidden_size)(x, c)
+        x = jnp.reshape(x, (B, n_side, n_side, ps, ps, C_out))
+        x = jnp.einsum('bhwpqc->bhpwqc', x)
+        x = rearrange(x, 'B H P W Q C -> B (H P) (W Q) C')
+
+        if return_debug:
+            debug["act_abs_per_layer"] = jnp.stack(act_abs)
+            debug["act_rms_per_layer"] = jnp.stack(act_rms)
+
+        if return_attn and return_debug:
+            return x, attn_list, debug
+        if return_attn:
+            return x, attn_list
+        if return_debug:
+            return x, debug
+        return x
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Legacy DiT Model (kept for backward compatibility)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class DiT(nn.Module):
