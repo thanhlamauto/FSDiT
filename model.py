@@ -477,26 +477,42 @@ class GramDiT(nn.Module):
         # Timestep embed
         t_emb = TimestepEmbedder(self.hidden_size)(t)  # (B, D)
 
-        # CLS conditioning embed (with CFG dropout)
-        cls_emb = SupportProjector(
-            self.hidden_size, self.siglip_dim, self.cond_dropout_prob
-        )(y_pooled, train=train, force_drop_ids=force_drop_ids)  # (B, D)
-
-        # Keep raw cls_token (before MLP projection) for cross-gram branch.
-        # Apply CFG dropout to raw token the same way.
+        # ── Unified CFG dropout ──────────────────────────────────────────────
+        # Compute ONE drop mask, apply consistently to both:
+        #   cls_emb (→ AdaLN conditioning c)  and  cls_token (→ cross-gram C)
+        # This prevents the inconsistency where one is dropped but not the other.
         if force_drop_ids is not None:
+            # Normalise to a (B,) int array so isinstance() is never called at
+            # trace time, avoiding an extra XLA retrace when type changes.
             if isinstance(force_drop_ids, bool):
-                cls_token = jnp.zeros_like(y_pooled) if force_drop_ids else y_pooled
+                # bool → broadcast scalar: True=drop-all, False=keep-all
+                drop_ids = jnp.ones((B,), dtype=jnp.int32) if force_drop_ids \
+                           else jnp.zeros((B,), dtype=jnp.int32)
             else:
-                mask = (force_drop_ids == 1)[:, None]
-                cls_token = jnp.where(mask, 0.0, y_pooled)
+                drop_ids = force_drop_ids  # already (B,) int
+            unified_mask = (drop_ids == 1)[:, None]   # (B, 1) bool
+            cls_token = jnp.where(unified_mask, 0.0, y_pooled)
+            # SupportProjector: pass the same normalised array, disable internal dropout
+            cls_emb = SupportProjector(
+                self.hidden_size, self.siglip_dim, self.cond_dropout_prob
+            )(y_pooled, train=False, force_drop_ids=drop_ids)
         elif train and self.cond_dropout_prob > 0:
+            # Training dropout: draw ONE mask, share for both branches
             drop = jax.random.bernoulli(
                 self.make_rng('cond_dropout'), self.cond_dropout_prob, (B,)
             )
-            cls_token = jnp.where(drop[:, None], 0.0, y_pooled)  # (B, siglip_dim)
+            unified_mask = drop[:, None]              # (B, 1)
+            cls_token = jnp.where(unified_mask, 0.0, y_pooled)
+            # Convert bool mask to int ids for SupportProjector
+            drop_ids = drop.astype(jnp.int32)
+            cls_emb = SupportProjector(
+                self.hidden_size, self.siglip_dim, self.cond_dropout_prob
+            )(y_pooled, train=False, force_drop_ids=drop_ids)
         else:
             cls_token = y_pooled
+            cls_emb = SupportProjector(
+                self.hidden_size, self.siglip_dim, self.cond_dropout_prob
+            )(y_pooled, train=False, force_drop_ids=False)
 
         # Project raw cls_token to hidden_size for cross-gram
         cls_token_proj = nn.Dense(
