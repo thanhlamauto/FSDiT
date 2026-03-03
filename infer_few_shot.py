@@ -6,7 +6,7 @@ os.environ["CUDA_VISIBLE_DEVICES"] = ""
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["RAY_DEDUP_LOGS"] = "0"
 os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
-os.environ["TRANSFORMERS_OFFLINE"] = "1"
+# Note: TRANSFORMERS_OFFLINE removed — tokenizer is loaded via sentencepiece directly
 # Stop TF from registering TPU/GPU devices — must be set before tensorflow is imported
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
@@ -61,13 +61,46 @@ def setup_big_vision():
     if repo not in sys.path:
         sys.path.insert(0, repo)
 
-def create_siglip2_jax(variant='B/16', res=224, load_tokenizer=False):
+# Path where the Gemma tokenizer vocab will be cached locally
+_GEMMA_TOK_LOCAL = '/tmp/gemma_tokenizer.model'
+# Public GCS URL for the Gemma tokenizer used by SigLIP2 (256K vocab)
+_GEMMA_TOK_URL = 'https://storage.googleapis.com/big_vision/gemma_tokenizer.model'
+
+
+def _load_sentencepiece_tokenizer(tokenizer_path=None):
+    """Load a SentencePiece tokenizer for SigLIP2 text encoding.
+
+    Uses a local file if `tokenizer_path` is provided, otherwise downloads
+    the Gemma tokenizer vocab from GCS (same pattern as SigLIP2 weights).
+    No HuggingFace / internet required after the initial download.
+    """
+    import sentencepiece as spm
+
+    model_path = tokenizer_path or _GEMMA_TOK_LOCAL
+    if not os.path.exists(model_path):
+        print(f"Downloading Gemma tokenizer → {model_path}")
+        ret = os.system(f'wget -q {_GEMMA_TOK_URL} -O {model_path}')
+        if ret != 0 or not os.path.exists(model_path):
+            raise RuntimeError(
+                f"Failed to download Gemma tokenizer from {_GEMMA_TOK_URL}. "
+                "Pass --tokenizer_path pointing to a local .model file."
+            )
+
+    print(f"Loading SentencePiece tokenizer from {model_path}")
+    sp = spm.SentencePieceProcessor(model_file=model_path)
+    return sp
+
+
+def create_siglip2_jax(variant='B/16', res=224, load_tokenizer=False,
+                       tokenizer_path=None):
     """Create SigLIP2 JAX model and load weights.
-    
+
     Args:
-        load_tokenizer: Only load HuggingFace tokenizer when needed (i.e. --text mode).
-                        Loading it unconditionally triggers TF/protobuf init that
-                        conflicts with the TPU runtime → SIGSEGV.
+        load_tokenizer: Only load the SentencePiece tokenizer when needed
+                        (i.e. --text mode). Loading it unconditionally may
+                        trigger TF/protobuf init that conflicts with TPU.
+        tokenizer_path: Optional path to a local SentencePiece .model file.
+                        Defaults to downloading from GCS on first use.
     """
     setup_big_vision()
     import big_vision.models.proj.image_text.two_towers as m
@@ -98,9 +131,8 @@ def create_siglip2_jax(variant='B/16', res=224, load_tokenizer=False):
 
     tokenizer = None
     if load_tokenizer:
-        from transformers import AutoTokenizer
-        print("Loading HuggingFace AutoTokenizer for text (CPU only)...")
-        tokenizer = AutoTokenizer.from_pretrained("google/siglip2-base-patch16-224", use_fast=False)
+        print("Loading SentencePiece tokenizer for text encoding...")
+        tokenizer = _load_sentencepiece_tokenizer(tokenizer_path)
 
     return model, params, emb_dim, tokenizer
 
@@ -143,8 +175,11 @@ def make_encode_txt_fn(model, params, emb_dim, tokenizer):
         return jax.lax.stop_gradient(seq), jax.lax.stop_gradient(pooled)
 
     def encode_text(text):
-        tokens = tokenizer([text], padding="max_length", max_length=64, return_tensors="np")["input_ids"]
-        tokens = tokens.astype(np.int32)
+        # Tokenize with SentencePiece: encode to int ids, pad/truncate to 64
+        ids = tokenizer.encode(text, out_type=int)
+        ids = ids[:64]  # truncate
+        ids = ids + [tokenizer.pad_id()] * (64 - len(ids))  # pad
+        tokens = np.array(ids, dtype=np.int32)[None]  # (1, 64)
         seq, pooled = encode(tokens)
         return np.asarray(seq), np.asarray(pooled)
 
@@ -170,6 +205,11 @@ def load_and_preprocess(path, image_size=224):
 def main():
     parser = argparse.ArgumentParser(description="Few-shot Inference with FSDiT (Kaggle compatible).")
     parser.add_argument('--text', type=str, default=None, help='Text prompt for condition. If provided, overrides image condition.')
+    parser.add_argument('--tokenizer_path', type=str, default=None,
+                        help='Path to a local SentencePiece .model file for text tokenization. '
+                             'If not provided, the Gemma tokenizer is downloaded from GCS on first use. '
+                             'Useful for fully-offline Kaggle environments: add the .model file as a '
+                             'Kaggle dataset and point this arg to its mounted path.')
     parser.add_argument('--img_dir', default='/kaggle/input/datasets/arjunashok33/miniimagenet/test', help='Directory with subfolders of images or just images.')
     parser.add_argument('--ckpt_path', default='/kaggle/input/models/lucastnguyen/dit-few-shot/flax/default/1/ckpt_step_0050000.pkl', help='DiT Checkpoint path.')
     parser.add_argument('--out_path', default='/kaggle/working/output_shot.png', help='Generated image output array.')
@@ -187,7 +227,9 @@ def main():
     # 1. Initialize SigLIP2
     # Only load tokenizer when --text is provided to avoid TF/protobuf SIGSEGV
     sig_model, sig_params, emb_dim, tokenizer = create_siglip2_jax(
-        args.variant, args.image_size, load_tokenizer=(args.text is not None)
+        args.variant, args.image_size,
+        load_tokenizer=(args.text is not None),
+        tokenizer_path=args.tokenizer_path,
     )
     encode_fn = make_encode_fn(sig_model, sig_params, emb_dim)
 
