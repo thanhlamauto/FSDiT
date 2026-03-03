@@ -101,6 +101,7 @@ flags.DEFINE_float('cond_dropout', None, 'Override cond_dropout (CFG dropout rat
 flags.DEFINE_float('weight_decay', None, 'Override weight_decay. Default: 0.01.')
 flags.DEFINE_float('lr', None, 'Override peak learning rate. Default: 1e-4.')
 flags.DEFINE_bool('use_support_seq', False, 'Unused in gram-adaln (no cross-attn). Kept for data pipeline backward compat.')
+flags.DEFINE_string('val_split', 'val', "Split name to use for validation: 'val' or 'test'.")
 flags.DEFINE_integer('gram_rank_s', 32, 'Self-gram low-rank dimension (0 = disabled).')
 flags.DEFINE_integer('gram_rank_c', 32, 'Cross-gram low-rank dimension (0 = disabled).')
 flags.DEFINE_bool('suppress_diffusers_warnings', True, 'Suppress repeated diffusers Flax deprecation warnings.')
@@ -429,7 +430,7 @@ def main(_):
         )
         val_iter = grain_mod.build_grain_dataset(
             arecord_dir=FLAGS.grain_arecord_dir,
-            split='val',
+            split=FLAGS.val_split,
             batch_size=local_bs,
             image_size=cfg.image_size,
             is_train=False,
