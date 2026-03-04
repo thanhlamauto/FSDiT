@@ -686,13 +686,12 @@ def main(_):
             wandb.log({f'samples/cfg_{cfg_val}': wandb.Image(fig)}, step=step)
             plt.close(fig)
 
-    def _compute_fid(step, sup_pooled_pmap, sup_seq_pmap, n_samples=2048):
+    def _compute_fid(step, n_samples=2048):
         """Compute FID: real stats from val_iter (cached), generated via Euler+CFG.
 
         Real image statistics are computed lazily from the validation iterator
-        on the FIRST call and then cached as function attributes (_compute_fid.mu_real
-        and _compute_fid.sigma_real). Subsequent calls reuse the cached stats.
-        No --fid_stats file is required.
+        on the FIRST call and then cached as function attributes.
+        Conditioning (sup_pooled/sup_seq) is fetched fresh from val_iter.
         """
         if jax.process_index() != 0:
             return
@@ -771,6 +770,16 @@ def main(_):
 
         mu_real    = _compute_fid.mu_real
         sigma_real = _compute_fid.sigma_real
+
+        # ── Get conditioning from val_iter ───────────────────────────────────
+        try:
+            cond_batch = next(val_iter)
+        except StopIteration:
+            print('[FID] val_iter exhausted, skipping FID this step.')
+            return
+        _, sup_pooled_pmap, sup_seq_pmap, _ = prepare_support_condition(cond_batch)
+        sup_pooled_pmap = sup_pooled_pmap.reshape(n_dev, -1, sup_pooled_pmap.shape[-1])
+        sup_seq_pmap    = sup_seq_pmap.reshape(n_dev, -1, *sup_seq_pmap.shape[1:])
 
         # ── Generate samples with Euler + CFG ────────────────────────────────
         sup_pooled_viz = sup_pooled_pmap[:, :1]
@@ -867,7 +876,7 @@ def main(_):
             cp.save()
             del cp, single
             # FID computed at same cadence as checkpoint saves (val stats lazily cached)
-            _compute_fid(step, val_sup_pooled, val_sup_seq)
+            _compute_fid(step)
 
 
 if __name__ == '__main__':
