@@ -37,10 +37,15 @@ def get_fid_network():
 
 def fid_from_stats(mu1, sigma1, mu2, sigma2):
     diff = mu1 - mu2
+    # Add small offset to each covariance matrix separately (standard approach,
+    # matching pytorch-fid) to ensure PSD before computing matrix sqrt.
     offset = np.eye(sigma1.shape[0]) * 1e-6
-    covmean, _ = scipy.linalg.sqrtm((sigma1 + offset) @ (sigma2 + offset), disp=False)
+    covmean, _ = scipy.linalg.sqrtm(
+        (sigma1 + offset) @ (sigma2 + offset), disp=False
+    )
     covmean = np.real(covmean)
-    fid = diff @ diff + jnp.trace(sigma1 + sigma2 - 2 * covmean)
+    # Use np.trace (not jnp.trace) — inputs are plain numpy arrays.
+    fid = diff @ diff + np.trace(sigma1 + sigma2 - 2 * covmean)
     return fid
 
 #######################################

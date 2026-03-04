@@ -448,6 +448,17 @@ def main(_):
             load_support_seq=FLAGS.use_support_seq,
             path_prefix_remaps=path_remaps,
         )
+        # Separate iterator exclusively for FID (avoids consuming val_iter)
+        fid_iter = grain_mod.build_grain_dataset(
+            arecord_dir=FLAGS.grain_arecord_dir,
+            split=FLAGS.val_split,
+            batch_size=local_bs,
+            image_size=cfg.image_size,
+            is_train=False,
+            seed=FLAGS.seed + 2000,
+            load_support_seq=FLAGS.use_support_seq,
+            path_prefix_remaps=path_remaps,
+        )
     else:
         train_pattern = None
         val_pattern = None
@@ -475,6 +486,8 @@ def main(_):
         )
         train_iter = iter(train_ds.as_numpy_iterator())
         val_iter = iter(val_ds.as_numpy_iterator())
+        # Separate iterator exclusively for FID (avoids consuming val_iter)
+        fid_iter = iter(val_ds.as_numpy_iterator())
 
     online_encoder = None
     if FLAGS.data_mode == 'online':
@@ -698,11 +711,12 @@ def main(_):
             plt.close(fig)
 
     def _compute_fid(step, n_samples=2048):
-        """Compute FID: real stats from val_iter (cached), generated via Euler+CFG.
+        """Compute FID: real stats from fid_iter (cached), generated via Euler+CFG.
 
-        Real image statistics are computed lazily from the validation iterator
-        on the FIRST call and then cached as function attributes.
-        Conditioning (sup_pooled/sup_seq) is fetched fresh from val_iter.
+        Uses a dedicated `fid_iter` (separate from `val_iter`) so that:
+          - computing real image stats does NOT consume val_iter batches.
+        Conditioning vectors are cycled across generation batches so generated
+        images represent diverse classes rather than a single conditioning.
         """
         if jax.process_index() != 0:
             return
@@ -715,59 +729,42 @@ def main(_):
         inception_fn = _compute_fid.inception
 
         def _imgs_to_acts(imgs_list):
-            """Decode list of [0,1] numpy images → InceptionV3 activations (N,2048)."""
+            """List of [0,1] numpy images (H,W,3) → InceptionV3 activations (N,2048)."""
             acts_all = []
-            # Process in chunks of n_dev (one image per device)
             for start in range(0, len(imgs_list), n_dev):
                 chunk = imgs_list[start:start + n_dev]
-                # Pad to n_dev if needed (last chunk)
-                while len(chunk) < n_dev:
+                while len(chunk) < n_dev:        # pad last chunk
                     chunk.append(chunk[-1])
                 imgs_299 = []
                 for img_px in chunk:
+                    # InceptionV3 expects [-1,1]
                     img_m1_1 = (img_px.astype(np.float32) * 2.0) - 1.0
                     img_299  = np.array(jax.image.resize(
                         img_m1_1, (299, 299, img_m1_1.shape[-1]), method='bilinear'
                     ))
                     imgs_299.append(img_299)
-                imgs_np   = np.stack(imgs_299, axis=0)  # (n_dev, 299, 299, C)
-                imgs_pmap = imgs_np[:, None]             # (n_dev, 1,   299, 299, C)
+                imgs_np   = np.stack(imgs_299, axis=0)   # (n_dev, 299, 299, 3)
+                imgs_pmap = imgs_np[:, None]              # (n_dev, 1,   299, 299, 3)
                 acts = np.array(inception_fn(imgs_pmap)).reshape(n_dev, 2048)
                 acts_all.append(acts)
             return np.concatenate(acts_all, axis=0)
 
-        # ── Compute real image stats (once) ──────────────────────────────────
+        # ── Compute real image stats once, using fid_iter (not val_iter) ─────
         if not hasattr(_compute_fid, 'mu_real'):
-            print('[FID] computing real image statistics from val_iter...')
+            print('[FID] computing real image statistics from fid_iter...')
             real_imgs = []
-            # Iterate val_iter until we have enough images
-            val_it = val_iter  # closure over outer val_iter
             while len(real_imgs) < n_samples:
                 try:
-                    vbatch = next(val_it)
+                    vbatch = next(fid_iter)   # ← dedicated iterator, val_iter untouched
                 except StopIteration:
-                    print('[FID] val_iter exhausted before reaching n_samples.')
+                    print('[FID] fid_iter exhausted before reaching n_samples.')
                     break
-                # Decode target images from the batch
-                targets = vbatch['target']                   # (local_bs, H, W, C_lat)
-                if cfg.use_vae:
-                    # vae_encode expects (n_dev, sub_bs, H, W, C)
-                    # but here we just need decoded pixels → encode first? No:
-                    # targets from val_iter are already raw images (not latents)
-                    # Only train images go through vae_encode inside train loop.
-                    # The val images are kept as pixels until vae_encode in run_eval.
-                    # So here: targets may be pixel images (H=224, W=224, C=3)
-                    # or latents depending on data mode. We just decode them.
-                    pass
+                targets = vbatch['target']    # (local_bs, H, W, C_lat or 3)
                 for i in range(targets.shape[0]):
                     img = targets[i]
-                    # If VAE used, targets from grain are already latent-encoded
-                    # (done outside during data loading). Decode them.
                     if cfg.use_vae and img.shape[-1] == img_c:
-                        # img is a latent: (H_lat, W_lat, img_c)
-                        img_px = decode_img(img)             # → [0,1] RGB
+                        img_px = decode_img(img)          # latent → [0,1] RGB
                     else:
-                        # Already a pixel image in [-1,1] or [0,1]
                         img_px = np.clip(img * 0.5 + 0.5, 0, 1).astype(np.float32)
                     real_imgs.append(img_px)
                     if len(real_imgs) >= n_samples:
@@ -782,25 +779,35 @@ def main(_):
         mu_real    = _compute_fid.mu_real
         sigma_real = _compute_fid.sigma_real
 
-        # ── Get conditioning from val_iter ───────────────────────────────────
-        try:
-            cond_batch = next(val_iter)
-        except StopIteration:
-            print('[FID] val_iter exhausted, skipping FID this step.')
+        # ── Pre-fetch diverse conditioning vectors from fid_iter ──────────────
+        # Cycle through N_COND_POOLS different conditions so generated images
+        # represent multiple classes instead of a single conditioning vector.
+        N_COND_POOLS = 16   # how many distinct conditioning batches to pre-fetch
+        cond_pool = []      # list of (n_dev, 1, siglip_dim) tensors
+        for _ in range(N_COND_POOLS):
+            try:
+                cb = next(fid_iter)
+            except StopIteration:
+                print('[FID] fid_iter exhausted while prefetching conditioning.')
+                break
+            _, sup_pooled_cb, sup_seq_cb, _ = prepare_support_condition(cb)
+            sup_pooled_cb = sup_pooled_cb.reshape(n_dev, -1, sup_pooled_cb.shape[-1])
+            sup_seq_cb    = sup_seq_cb.reshape(n_dev, -1, *sup_seq_cb.shape[1:])
+            cond_pool.append((sup_pooled_cb[:, :1], sup_seq_cb[:, :1]))
+        if not cond_pool:
+            print('[FID] no conditioning batches available, skipping FID.')
             return
-        _, sup_pooled_pmap, sup_seq_pmap, _ = prepare_support_condition(cond_batch)
-        sup_pooled_pmap = sup_pooled_pmap.reshape(n_dev, -1, sup_pooled_pmap.shape[-1])
-        sup_seq_pmap    = sup_seq_pmap.reshape(n_dev, -1, *sup_seq_pmap.shape[1:])
 
-        # ── Generate samples with Euler + CFG ────────────────────────────────
-        sup_pooled_viz = sup_pooled_pmap[:, :1]
-        sup_seq_viz    = sup_seq_pmap[:, :1]
+        # ── Generate samples with Euler + CFG, cycling conditioning ──────────
         dt = 1.0 / cfg.denoise_steps
         n_batches = int(np.ceil(n_samples / n_dev))
         print(f'[FID] generating {n_batches * n_dev} images @ step {step}...')
 
         gen_imgs = []
         for bi in range(n_batches):
+            # Cycle through pre-fetched conditioning pools
+            sup_pooled_viz, sup_seq_viz = cond_pool[bi % len(cond_pool)]
+
             key = jax.random.PRNGKey(10000 + step + bi)
             x = jax.random.normal(key, (n_dev, 1, img_s, img_s, img_c))
             for ti in range(cfg.denoise_steps):
