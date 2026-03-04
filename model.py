@@ -302,7 +302,10 @@ class GramDiTBlock(nn.Module):
             # v_c: project patch tokens into gram space  (B, N, r_c)
             v_c = jnp.einsum('bnd,bdr->bnr', X_prime, u_c)
             gram_c = jnp.einsum('bnr,rd->bnd', v_c, D_r)  # (B, N, D)
-            Z = RMSNorm()(gram_c)                          # no residual add per diagram
+            # Residual +X_prime is essential for identity path at init:
+            # D_r=zeros → gram_c=0 → RMSNorm(0)=0, so Z=X_prime at init.
+            # Without this, Z=0, out=0, and all gradients are dead.
+            Z = X_prime + RMSNorm()(gram_c)
         else:
             Z = X_prime
 
