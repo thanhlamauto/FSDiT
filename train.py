@@ -226,20 +226,20 @@ class Trainer(flax.struct.PyTreeNode):
             x_t = flow_interpolate(images, eps, t[:, None, None, None])
             v_gt = flow_velocity(images, eps)
             sup_pooled = support_pooled.astype(images.dtype)
-            # split one extra key for gram dropout
-            cond_key, drop_key = jax.random.split(cond_key)
+            # split one extra key for gram dropout (use distinct names to avoid Python closure issue)
+            cond_key_inner, drop_key = jax.random.split(cond_key)
             # GramDiT uses only pooled CLS (no y_seq / context)
             if self.config.get('log_model_debug', 1):
                 v_pred, dbg = self.model(
                     x_t, t, sup_pooled, train=True,
                     return_debug=True,
-                    rngs={'cond_dropout': cond_key, 'dropout': drop_key},
+                    rngs={'cond_dropout': cond_key_inner, 'dropout': drop_key},
                     params=params,
                 )
             else:
                 v_pred = self.model(
                     x_t, t, sup_pooled, train=True,
-                    rngs={'cond_dropout': cond_key, 'dropout': drop_key},
+                    rngs={'cond_dropout': cond_key_inner, 'dropout': drop_key},
                     params=params,
                 )
                 dbg = None
