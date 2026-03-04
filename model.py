@@ -245,11 +245,12 @@ class GramDiTBlock(nn.Module):
     hidden_size: int
     num_heads: int
     mlp_ratio: float = 4.0
-    gram_rank_s: int = 32   # rank for self-gram
-    gram_rank_c: int = 32   # rank for cross-gram
+    gram_rank_s: int = 16   # rank for self-gram
+    gram_rank_c: int = 16   # rank for cross-gram
+    gram_dropout: float = 0.1  # dropout on gram branch outputs
 
     @nn.compact
-    def __call__(self, x, c, cls_token, return_attn=False):
+    def __call__(self, x, c, cls_token, train=False, return_attn=False):
         """
         Args:
             x:         (B, N, D)  patch tokens
@@ -281,31 +282,27 @@ class GramDiTBlock(nn.Module):
         attn_out = nn.Dense(D, kernel_init=nn.initializers.xavier_uniform())(attn_out)
         Y = x + gate_a[:, None] * attn_out  # (B, N, D)
 
-        # ── Self-Gram Branch: X' = RMSNorm( X · (X^T·A_s) · B_s ) + Y ──
+        # ── Self-Gram Branch: X' = Dropout(RMSNorm( X · (X^T·A_s) · B_s )) + Y ──
         if r_s > 0:
             A_s = self.param('A_s', nn.initializers.truncated_normal(0.02), (D, r_s))
             B_s = self.param('B_s', nn.initializers.zeros, (r_s, D))
             # Efficient: avoid N×N gram matrix
             u_s = jnp.einsum('bnd,dr->bnr', x, A_s)       # (B, N, r_s)
             gram_s = jnp.einsum('bnr,rd->bnd', u_s, B_s)  # (B, N, D)
-            X_prime = RMSNorm()(gram_s) + Y
+            gram_s = nn.Dropout(self.gram_dropout)(RMSNorm()(gram_s), deterministic=not train)
+            X_prime = gram_s + Y
         else:
             X_prime = Y
 
-        # ── Cross-Gram Branch: Z = RMSNorm( X' · (C^T·C_r) · D_r ) ──
-        # C = cls_token: (B, D) — per-sample, so u_c is per-sample
+        # ── Cross-Gram Branch: Z = X' + Dropout(RMSNorm( X' · (C^T·C_r) · D_r )) ──
         if r_c > 0:
             C_r = self.param('C_r', nn.initializers.truncated_normal(0.02), (D, r_c))
             D_r = self.param('D_r', nn.initializers.zeros, (r_c, D))
-            # u_c: per-sample projection matrix  (B, D, r_c)
             u_c = jnp.einsum('bd,dr->bdr', cls_token, C_r)
-            # v_c: project patch tokens into gram space  (B, N, r_c)
             v_c = jnp.einsum('bnd,bdr->bnr', X_prime, u_c)
             gram_c = jnp.einsum('bnr,rd->bnd', v_c, D_r)  # (B, N, D)
-            # Residual +X_prime is essential for identity path at init:
-            # D_r=zeros → gram_c=0 → RMSNorm(0)=0, so Z=X_prime at init.
-            # Without this, Z=0, out=0, and all gradients are dead.
-            Z = X_prime + RMSNorm()(gram_c)
+            gram_c = nn.Dropout(self.gram_dropout)(RMSNorm()(gram_c), deterministic=not train)
+            Z = X_prime + gram_c
         else:
             Z = X_prime
 
@@ -448,8 +445,9 @@ class GramDiT(nn.Module):
     mlp_ratio: float
     siglip_dim: int = 768      # CLS token dim (SigLIP2-B/16 or DINOv2-B)
     cond_dropout_prob: float = 0.1
-    gram_rank_s: int = 32      # self-gram rank
-    gram_rank_c: int = 32      # cross-gram rank
+    gram_rank_s: int = 16      # self-gram rank
+    gram_rank_c: int = 16      # cross-gram rank
+    gram_dropout: float = 0.1  # dropout on gram branch outputs
     learn_sigma: bool = False
 
     @nn.compact
@@ -524,11 +522,15 @@ class GramDiT(nn.Module):
             name='cls_token_proj'
         )(cls_token)  # (B, D)
 
-        # Global conditioning signal: c = LN(t_emb) + cond_scale * LN(cls_emb)
+        # Global conditioning: concat(t_emb_n, y_emb_n) → Linear(2D→D)
+        # Concat is more expressive than scalar add; removes learnable cond_scale.
         t_emb_n = nn.LayerNorm(name='t_emb_ln')(t_emb)
         y_emb_n = nn.LayerNorm(name='y_emb_ln')(cls_emb)
-        cond_scale = self.param('cond_scale', nn.initializers.constant(2.0), ())
-        c = t_emb_n + cond_scale * y_emb_n  # (B, D)
+        c = nn.Dense(
+            self.hidden_size,
+            kernel_init=nn.initializers.normal(0.02),
+            name='cond_proj',
+        )(jnp.concatenate([t_emb_n, y_emb_n], axis=-1))   # (B, 2D) → (B, D)
 
         debug = None
         act_abs = []
@@ -551,14 +553,14 @@ class GramDiT(nn.Module):
             if return_attn:
                 x, aw = GramDiTBlock(
                     self.hidden_size, self.num_heads, self.mlp_ratio,
-                    self.gram_rank_s, self.gram_rank_c
-                )(x, c, cls_token_proj, return_attn=True)
+                    self.gram_rank_s, self.gram_rank_c, self.gram_dropout
+                )(x, c, cls_token_proj, train=train, return_attn=True)
                 attn_list.append(aw)
             else:
                 x = GramDiTBlock(
                     self.hidden_size, self.num_heads, self.mlp_ratio,
-                    self.gram_rank_s, self.gram_rank_c
-                )(x, c, cls_token_proj)
+                    self.gram_rank_s, self.gram_rank_c, self.gram_dropout
+                )(x, c, cls_token_proj, train=train)
             if return_debug:
                 x_f32 = x.astype(jnp.float32)
                 act_abs.append(jnp.mean(jnp.abs(x_f32)))

@@ -103,8 +103,9 @@ flags.DEFINE_float('weight_decay', None, 'Override weight_decay. Default: 0.01.'
 flags.DEFINE_float('lr', None, 'Override peak learning rate. Default: 1e-4.')
 flags.DEFINE_bool('use_support_seq', False, 'Unused in gram-adaln (no cross-attn). Kept for data pipeline backward compat.')
 flags.DEFINE_string('val_split', 'val', "Split name to use for validation: 'val' or 'test'.")
-flags.DEFINE_integer('gram_rank_s', 32, 'Self-gram low-rank dimension (0 = disabled).')
-flags.DEFINE_integer('gram_rank_c', 32, 'Cross-gram low-rank dimension (0 = disabled).')
+flags.DEFINE_integer('gram_rank_s', 16, 'Self-gram low-rank dimension (0 = disabled).')
+flags.DEFINE_integer('gram_rank_c', 16, 'Cross-gram low-rank dimension (0 = disabled).')
+flags.DEFINE_float('gram_dropout', 0.1, 'Dropout rate on gram branch outputs.')
 flags.DEFINE_bool('suppress_diffusers_warnings', True, 'Suppress repeated diffusers Flax deprecation warnings.')
 flags.DEFINE_bool('log_model_debug', True, 'Log model activation/condition debug metrics.')
 # Logging
@@ -135,8 +136,9 @@ model_config = ml_collections.ConfigDict({
     'siglip_dim': 768,       # CLS token dim (SigLIP2-B/16 or DINOv2-B)
     'cond_dropout': 0.1,     # CFG: zero support 10% of time
     # ── Gram Ranks ──
-    'gram_rank_s': 32,       # self-gram rank (0 = disabled)
-    'gram_rank_c': 32,       # cross-gram rank (0 = disabled)
+    'gram_rank_s': 16,       # self-gram rank (0 = disabled)
+    'gram_rank_c': 16,       # cross-gram rank (0 = disabled)
+    'gram_dropout': 0.1,     # dropout on gram branch outputs
     # ── Flow Matching ──
     'denoise_steps': 50,     # Euler steps for sampling
     'cfg_scale': 3.0,        # classifier-free guidance scale
@@ -224,16 +226,21 @@ class Trainer(flax.struct.PyTreeNode):
             x_t = flow_interpolate(images, eps, t[:, None, None, None])
             v_gt = flow_velocity(images, eps)
             sup_pooled = support_pooled.astype(images.dtype)
+            # split one extra key for gram dropout
+            cond_key, drop_key = jax.random.split(cond_key)
             # GramDiT uses only pooled CLS (no y_seq / context)
             if self.config.get('log_model_debug', 1):
                 v_pred, dbg = self.model(
                     x_t, t, sup_pooled, train=True,
-                    return_debug=True, rngs={'cond_dropout': cond_key}, params=params,
+                    return_debug=True,
+                    rngs={'cond_dropout': cond_key, 'dropout': drop_key},
+                    params=params,
                 )
             else:
                 v_pred = self.model(
                     x_t, t, sup_pooled, train=True,
-                    rngs={'cond_dropout': cond_key}, params=params,
+                    rngs={'cond_dropout': cond_key, 'dropout': drop_key},
+                    params=params,
                 )
                 dbg = None
             mse = (v_pred - v_gt) ** 2
@@ -360,6 +367,7 @@ def main(_):
     # Gram rank CLI overrides
     cfg.gram_rank_s = FLAGS.gram_rank_s
     cfg.gram_rank_c = FLAGS.gram_rank_c
+    cfg.gram_dropout = FLAGS.gram_dropout
     # Other CLI overrides for tuning
     if FLAGS.cond_dropout is not None:
         cfg.cond_dropout = FLAGS.cond_dropout
@@ -508,15 +516,16 @@ def main(_):
         depth=cfg.depth, num_heads=cfg.num_heads, mlp_ratio=cfg.mlp_ratio,
         siglip_dim=cfg.siglip_dim, cond_dropout_prob=cfg.cond_dropout,
         gram_rank_s=cfg.gram_rank_s, gram_rank_c=cfg.gram_rank_c,
+        gram_dropout=cfg.gram_dropout,
     )
     params = dit.init(
-        {'params': p_key, 'cond_dropout': d_key},
+        {'params': p_key, 'cond_dropout': d_key, 'dropout': d_key},
         jnp.zeros((1, img_s, img_s, img_c)),   # x
         jnp.zeros((1,)),                        # t
         jnp.zeros((1, cfg.siglip_dim)),         # y_pooled (CLS token)
     )['params']
     n_params = sum(x.size for x in jax.tree_util.tree_leaves(params))
-    print(f"GramDiT parameters: {n_params:,} | gram_rank_s={cfg.gram_rank_s}, gram_rank_c={cfg.gram_rank_c}")
+    print(f"GramDiT parameters: {n_params:,} | gram_rank_s={cfg.gram_rank_s}, gram_rank_c={cfg.gram_rank_c}, gram_dropout={cfg.gram_dropout}")
 
     # ── Optimizer: warmup → cosine decay + grad clip + AdamW ──────────────
     max_steps = int(FLAGS.max_steps)
