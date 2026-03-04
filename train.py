@@ -45,6 +45,7 @@ from utils.checkpoint import Checkpoint
 from utils.stable_vae import StableVAE
 from utils.online_support_encoder import OnlineSupportEncoder
 from utils.wandb_utils import setup_wandb, default_wandb_config
+from utils.fid import get_fid_network, fid_from_stats
 from utils.logging import (
     compute_condition_distribution_metrics,
     log_train_metrics,
@@ -685,6 +686,74 @@ def main(_):
             wandb.log({f'samples/cfg_{cfg_val}': wandb.Image(fig)}, step=step)
             plt.close(fig)
 
+    def _compute_fid(step, sup_pooled_pmap, sup_seq_pmap, n_samples=2048):
+        """Generate samples, extract InceptionV3 features, compute FID.
+
+        Args:
+            n_samples: total generated images (rounded up to multiple of n_dev).
+                       Mini-ImageNet has ~600 test images per class — 2048 is
+                       enough for a reliable FID estimate at this scale.
+        """
+        if FLAGS.fid_stats is None or jax.process_index() != 0:
+            return
+
+        real_stats = np.load(FLAGS.fid_stats)
+        mu_real   = real_stats['mu']    # (2048,)
+        sigma_real = real_stats['sigma'] # (2048, 2048)
+
+        # Lazy-init InceptionV3 (pmap'd, pretrained weights auto-downloaded)
+        if not hasattr(_compute_fid, 'inception'):
+            print('[FID] loading InceptionV3...')
+            _compute_fid.inception = get_fid_network()
+            print('[FID] InceptionV3 ready.')
+
+        inception_fn = _compute_fid.inception
+
+        sup_pooled_viz = sup_pooled_pmap[:, :1]  # (ndev, 1, siglip_dim)
+        sup_seq_viz    = sup_seq_pmap[:, :1]      # (ndev, 1, T, dim)  (dummy)
+        dt = 1.0 / cfg.denoise_steps
+
+        all_acts = []
+        n_batches = int(np.ceil(n_samples / n_dev))
+        print(f'[FID] generating {n_batches * n_dev} images @ step {step}...')
+
+        for bi in range(n_batches):
+            key = jax.random.PRNGKey(10000 + step + bi)
+            shape = (n_dev, 1, img_s, img_s, img_c)
+            x = jax.random.normal(key, shape)
+
+            # Euler integration with CFG
+            for ti in range(cfg.denoise_steps):
+                t_vec = jnp.full((n_dev, 1), ti / cfg.denoise_steps)
+                x = x + trainer.sample_step(
+                    x, t_vec, sup_pooled_viz, sup_seq_viz, True, cfg.cfg_scale
+                ) * dt
+
+            # Decode: (ndev, 1, H, W, C_latent) → (ndev, H_px, W_px, 3) in [-1,1]
+            imgs = []
+            for di in range(n_dev):
+                img_px = decode_img(np.array(x)[di, 0])          # [0,1]
+                img_m1_1 = (img_px.astype(np.float32) * 2) - 1   # [-1,1]
+                # InceptionV3 expects 299×299; resize with jax.image
+                img_299 = jax.image.resize(
+                    img_m1_1, (299, 299, img_m1_1.shape[-1]), method='bilinear'
+                )
+                imgs.append(img_299)
+
+            # Stack & shard across devices for pmap
+            imgs_np   = np.stack(imgs, axis=0)          # (ndev, 299, 299, C)
+            imgs_pmap = imgs_np[:, None]                 # (ndev, 1,   299, 299, C)
+            # inception_fn: pmap'd, each device gets 1 image → (ndev,1,1,1,2048)
+            acts = np.array(inception_fn(imgs_pmap)).reshape(n_dev, 2048)
+            all_acts.append(acts)
+
+        all_acts = np.concatenate(all_acts, axis=0)[:n_samples]   # (n_samples, 2048)
+        mu_gen    = np.mean(all_acts, axis=0)
+        sigma_gen = np.cov(all_acts, rowvar=False)
+        fid = float(fid_from_stats(mu_real, sigma_real, mu_gen, sigma_gen))
+        print(f'[FID] step {step}: FID = {fid:.2f}')
+        wandb.log({'fid': fid}, step=step)
+
     # ═══════════════════════════════════════════════════════════════════════
     #  TRAIN LOOP
     # ═══════════════════════════════════════════════════════════════════════
@@ -749,7 +818,7 @@ def main(_):
         if step % FLAGS.eval_interval == 0 or step == 1000:
             run_eval(step)
 
-        # ── Save ──
+        # ── Save + FID ──
         if step % FLAGS.save_interval == 0 and FLAGS.save_dir and jax.process_index() == 0:
             single = flax.jax_utils.unreplicate(trainer)
             ckpt_path = os.path.join(FLAGS.save_dir, f'checkpoint_step_{step}.pkl')
@@ -757,6 +826,9 @@ def main(_):
             cp.set_model(single)
             cp.save()
             del cp, single
+            # FID computed at same cadence as checkpoint saves
+            if FLAGS.fid_stats:
+                _compute_fid(step, val_sup_pooled, val_sup_seq)
 
 
 if __name__ == '__main__':
