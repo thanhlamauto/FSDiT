@@ -687,69 +687,113 @@ def main(_):
             plt.close(fig)
 
     def _compute_fid(step, sup_pooled_pmap, sup_seq_pmap, n_samples=2048):
-        """Generate samples, extract InceptionV3 features, compute FID.
+        """Compute FID: real stats from val_iter (cached), generated via Euler+CFG.
 
-        Args:
-            n_samples: total generated images (rounded up to multiple of n_dev).
-                       Mini-ImageNet has ~600 test images per class — 2048 is
-                       enough for a reliable FID estimate at this scale.
+        Real image statistics are computed lazily from the validation iterator
+        on the FIRST call and then cached as function attributes (_compute_fid.mu_real
+        and _compute_fid.sigma_real). Subsequent calls reuse the cached stats.
+        No --fid_stats file is required.
         """
-        if FLAGS.fid_stats is None or jax.process_index() != 0:
+        if jax.process_index() != 0:
             return
 
-        real_stats = np.load(FLAGS.fid_stats)
-        mu_real   = real_stats['mu']    # (2048,)
-        sigma_real = real_stats['sigma'] # (2048, 2048)
-
-        # Lazy-init InceptionV3 (pmap'd, pretrained weights auto-downloaded)
+        # ── Lazy-init InceptionV3 ────────────────────────────────────────────
         if not hasattr(_compute_fid, 'inception'):
-            print('[FID] loading InceptionV3...')
+            print('[FID] loading InceptionV3 (pre-trained weights)...')
             _compute_fid.inception = get_fid_network()
             print('[FID] InceptionV3 ready.')
-
         inception_fn = _compute_fid.inception
 
-        sup_pooled_viz = sup_pooled_pmap[:, :1]  # (ndev, 1, siglip_dim)
-        sup_seq_viz    = sup_seq_pmap[:, :1]      # (ndev, 1, T, dim)  (dummy)
-        dt = 1.0 / cfg.denoise_steps
+        def _imgs_to_acts(imgs_list):
+            """Decode list of [0,1] numpy images → InceptionV3 activations (N,2048)."""
+            acts_all = []
+            # Process in chunks of n_dev (one image per device)
+            for start in range(0, len(imgs_list), n_dev):
+                chunk = imgs_list[start:start + n_dev]
+                # Pad to n_dev if needed (last chunk)
+                while len(chunk) < n_dev:
+                    chunk.append(chunk[-1])
+                imgs_299 = []
+                for img_px in chunk:
+                    img_m1_1 = (img_px.astype(np.float32) * 2.0) - 1.0
+                    img_299  = np.array(jax.image.resize(
+                        img_m1_1, (299, 299, img_m1_1.shape[-1]), method='bilinear'
+                    ))
+                    imgs_299.append(img_299)
+                imgs_np   = np.stack(imgs_299, axis=0)  # (n_dev, 299, 299, C)
+                imgs_pmap = imgs_np[:, None]             # (n_dev, 1,   299, 299, C)
+                acts = np.array(inception_fn(imgs_pmap)).reshape(n_dev, 2048)
+                acts_all.append(acts)
+            return np.concatenate(acts_all, axis=0)
 
-        all_acts = []
+        # ── Compute real image stats (once) ──────────────────────────────────
+        if not hasattr(_compute_fid, 'mu_real'):
+            print('[FID] computing real image statistics from val_iter...')
+            real_imgs = []
+            # Iterate val_iter until we have enough images
+            val_it = val_iter  # closure over outer val_iter
+            while len(real_imgs) < n_samples:
+                try:
+                    vbatch = next(val_it)
+                except StopIteration:
+                    print('[FID] val_iter exhausted before reaching n_samples.')
+                    break
+                # Decode target images from the batch
+                targets = vbatch['target']                   # (local_bs, H, W, C_lat)
+                if cfg.use_vae:
+                    # vae_encode expects (n_dev, sub_bs, H, W, C)
+                    # but here we just need decoded pixels → encode first? No:
+                    # targets from val_iter are already raw images (not latents)
+                    # Only train images go through vae_encode inside train loop.
+                    # The val images are kept as pixels until vae_encode in run_eval.
+                    # So here: targets may be pixel images (H=224, W=224, C=3)
+                    # or latents depending on data mode. We just decode them.
+                    pass
+                for i in range(targets.shape[0]):
+                    img = targets[i]
+                    # If VAE used, targets from grain are already latent-encoded
+                    # (done outside during data loading). Decode them.
+                    if cfg.use_vae and img.shape[-1] == img_c:
+                        # img is a latent: (H_lat, W_lat, img_c)
+                        img_px = decode_img(img)             # → [0,1] RGB
+                    else:
+                        # Already a pixel image in [-1,1] or [0,1]
+                        img_px = np.clip(img * 0.5 + 0.5, 0, 1).astype(np.float32)
+                    real_imgs.append(img_px)
+                    if len(real_imgs) >= n_samples:
+                        break
+
+            print(f'[FID] collected {len(real_imgs)} real images.')
+            real_acts = _imgs_to_acts(real_imgs[:n_samples])
+            _compute_fid.mu_real    = np.mean(real_acts, axis=0)
+            _compute_fid.sigma_real = np.cov(real_acts, rowvar=False)
+            print('[FID] real image stats ready.')
+
+        mu_real    = _compute_fid.mu_real
+        sigma_real = _compute_fid.sigma_real
+
+        # ── Generate samples with Euler + CFG ────────────────────────────────
+        sup_pooled_viz = sup_pooled_pmap[:, :1]
+        sup_seq_viz    = sup_seq_pmap[:, :1]
+        dt = 1.0 / cfg.denoise_steps
         n_batches = int(np.ceil(n_samples / n_dev))
         print(f'[FID] generating {n_batches * n_dev} images @ step {step}...')
 
+        gen_imgs = []
         for bi in range(n_batches):
             key = jax.random.PRNGKey(10000 + step + bi)
-            shape = (n_dev, 1, img_s, img_s, img_c)
-            x = jax.random.normal(key, shape)
-
-            # Euler integration with CFG
+            x = jax.random.normal(key, (n_dev, 1, img_s, img_s, img_c))
             for ti in range(cfg.denoise_steps):
                 t_vec = jnp.full((n_dev, 1), ti / cfg.denoise_steps)
                 x = x + trainer.sample_step(
                     x, t_vec, sup_pooled_viz, sup_seq_viz, True, cfg.cfg_scale
                 ) * dt
-
-            # Decode: (ndev, 1, H, W, C_latent) → (ndev, H_px, W_px, 3) in [-1,1]
-            imgs = []
             for di in range(n_dev):
-                img_px = decode_img(np.array(x)[di, 0])          # [0,1]
-                img_m1_1 = (img_px.astype(np.float32) * 2) - 1   # [-1,1]
-                # InceptionV3 expects 299×299; resize with jax.image
-                img_299 = jax.image.resize(
-                    img_m1_1, (299, 299, img_m1_1.shape[-1]), method='bilinear'
-                )
-                imgs.append(img_299)
+                gen_imgs.append(decode_img(np.array(x)[di, 0]))   # [0,1]
 
-            # Stack & shard across devices for pmap
-            imgs_np   = np.stack(imgs, axis=0)          # (ndev, 299, 299, C)
-            imgs_pmap = imgs_np[:, None]                 # (ndev, 1,   299, 299, C)
-            # inception_fn: pmap'd, each device gets 1 image → (ndev,1,1,1,2048)
-            acts = np.array(inception_fn(imgs_pmap)).reshape(n_dev, 2048)
-            all_acts.append(acts)
-
-        all_acts = np.concatenate(all_acts, axis=0)[:n_samples]   # (n_samples, 2048)
-        mu_gen    = np.mean(all_acts, axis=0)
-        sigma_gen = np.cov(all_acts, rowvar=False)
+        gen_acts  = _imgs_to_acts(gen_imgs[:n_samples])
+        mu_gen    = np.mean(gen_acts, axis=0)
+        sigma_gen = np.cov(gen_acts, rowvar=False)
         fid = float(fid_from_stats(mu_real, sigma_real, mu_gen, sigma_gen))
         print(f'[FID] step {step}: FID = {fid:.2f}')
         wandb.log({'fid': fid}, step=step)
@@ -826,9 +870,8 @@ def main(_):
             cp.set_model(single)
             cp.save()
             del cp, single
-            # FID computed at same cadence as checkpoint saves
-            if FLAGS.fid_stats:
-                _compute_fid(step, val_sup_pooled, val_sup_seq)
+            # FID computed at same cadence as checkpoint saves (val stats lazily cached)
+            _compute_fid(step, val_sup_pooled, val_sup_seq)
 
 
 if __name__ == '__main__':
