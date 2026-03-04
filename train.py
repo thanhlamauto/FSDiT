@@ -49,9 +49,9 @@ from utils.fid import get_fid_network, fid_from_stats
 from utils.logging import (
     compute_condition_distribution_metrics,
     log_train_metrics,
-    log_perf_metrics,
     log_eval_metrics,
     log_attn_entropy,
+    AsyncLogger,
 )
 
 # Lazy import for grain mode (only needed when --data_mode=grain)
@@ -400,6 +400,7 @@ def main(_):
 
     if jax.process_index() == 0:
         setup_wandb(cfg.to_dict(), **FLAGS.wandb)
+    async_logger = AsyncLogger() if jax.process_index() == 0 else None
 
     # ── Data ───────────────────────────────────────────────────────────────
     if FLAGS.data_mode == 'grain':
@@ -641,13 +642,14 @@ def main(_):
                 val_sup_pooled_global, val_class_ids,
                 data_mode=FLAGS.data_mode, val_siglip_stats=val_siglip_stats,
                 cond_hist_interval=FLAGS.cond_hist_interval,
+                async_logger=async_logger,
             )
 
         # Attention entropy
         try:
             ent_matrix, _ = trainer.get_attn_entropy(val_img, val_sup_pooled, val_sup_seq)
             if jax.process_index() == 0:
-                log_attn_entropy(step, ent_matrix, cfg)
+                log_attn_entropy(step, ent_matrix, cfg, async_logger=async_logger)
         except Exception as e:
             print(f"Attn entropy failed: {e}")
 
@@ -859,6 +861,7 @@ def main(_):
                 class_ids_global=class_ids_global,
                 log_model_debug=FLAGS.log_model_debug,
                 cond_hist_interval=FLAGS.cond_hist_interval,
+                async_logger=async_logger,
             )
 
 
@@ -877,6 +880,10 @@ def main(_):
             del cp, single
             # FID computed at same cadence as checkpoint saves (val stats lazily cached)
             _compute_fid(step)
+
+    # Flush async logger before exit
+    if async_logger is not None:
+        async_logger.wait()
 
 
 if __name__ == '__main__':

@@ -7,11 +7,71 @@ and log to wandb.
 """
 
 import numpy as np
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 try:
     import wandb
 except ImportError:
     wandb = None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Async wandb logger — prevents main thread from blocking on device sync
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class AsyncLogger:
+    """Log metrics to W&B in a background thread.
+
+    Usage:
+        logger = AsyncLogger()
+        logger.log({'loss': jax_array, 'lr': 0.001}, step=step)
+        # ... training continues immediately, logging happens in background
+
+    The background thread materialises JAX arrays (blocking on device sync
+    there, not on the main thread) and calls wandb.log.
+    """
+
+    def __init__(self, max_workers: int = 1):
+        # Single worker so logs arrive in order.
+        self._pool = ThreadPoolExecutor(max_workers=max_workers,
+                                        thread_name_prefix='wandb_log')
+        self._lock = threading.Lock()
+
+    def log(self, log_dict: dict, step: int):
+        """Submit a logging job to the background thread.
+
+        JAX / numpy arrays are passed by reference; the background thread
+        will materialise them (np.asarray / float conversion).  The main
+        training loop returns immediately.
+        """
+        if wandb is None:
+            return
+        # Snapshot the dict so the caller can reuse keys safely.
+        snapshot = dict(log_dict)
+        self._pool.submit(self._do_log, snapshot, step)
+
+    @staticmethod
+    def _do_log(log_dict: dict, step: int):
+        """Run on background thread: convert arrays → scalars, then log."""
+        materialised = {}
+        for k, v in log_dict.items():
+            try:
+                # Works for JAX arrays, numpy arrays, plain Python scalars,
+                # and wandb.Histogram / wandb.Image objects.
+                if hasattr(v, 'shape'):          # array-like
+                    v = float(np.asarray(v).mean()) if v.ndim > 0 else float(np.asarray(v))
+                materialised[k] = v
+            except Exception:
+                pass                             # skip unserializable values
+        try:
+            wandb.log(materialised, step=step)
+        except Exception:
+            pass
+
+    def wait(self):
+        """Block until all pending log jobs are flushed (call at end of training)."""
+        self._pool.shutdown(wait=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -76,22 +136,16 @@ def log_train_metrics(
     step, info, loss_ema, lr_schedule, cfg, dt_step=0.0,
     sup_pooled_global=None, class_ids_global=None,
     log_model_debug=True, cond_hist_interval=5000,
+    async_logger=None,
 ):
     """
-    Log training metrics to wandb.
+    Log training metrics to wandb (optionally async).
 
-    Args:
-        step: Current training step.
-        info: Dict returned by Trainer.train_step (contains pmap-ed arrays).
-        loss_ema: Mutable [float] container for EMA loss.
-        lr_schedule: optax learning rate schedule callable.
-        cfg: Model config dict.
-        dt_step: Total wall-clock time for this iteration.
-        sup_pooled_global: (B, 768) support embeddings for condition metrics.
-        class_ids_global: (B,) class IDs for condition metrics.
-        log_model_debug: Whether to log model debug metrics.
-        cond_hist_interval: Steps between condition histogram logging.
+    If async_logger is provided (AsyncLogger instance), all wandb.log calls
+    are dispatched to a background thread so the main training loop never
+    blocks on JAX device synchronisation.
     """
+    # loss_ema must be updated synchronously (it feeds back into future steps)
     alpha = cfg.loss_ema_alpha
     train_loss = float(np.array(info['loss']).mean())
     if loss_ema[0] is None:
@@ -99,75 +153,67 @@ def log_train_metrics(
     else:
         loss_ema[0] = alpha * loss_ema[0] + (1 - alpha) * train_loss
 
+    # Build log dict — raw JAX arrays OK; AsyncLogger materialises them on bg thread
     log = {
-        'train/loss': train_loss,
-        'train/loss_ema': loss_ema[0],
-        'train/grad_norm': float(np.array(info['grad_norm']).mean()),
-        'train/lr': float(lr_schedule(step)),
+        'train/loss':      info['loss'],
+        'train/loss_ema':  loss_ema[0],
+        'train/grad_norm': info['grad_norm'],
+        'train/lr':        float(lr_schedule(step)),
         'train/step_time': dt_step,
-        'train/param_norm': float(np.array(info['param_norm']).mean()),
+        'train/param_norm': info['param_norm'],
     }
-    tbin = np.array(info['tbin_loss']).mean(axis=0)
     for b in range(cfg.num_t_bins):
-        log[f'train/loss_tbin_{b}'] = float(tbin[b])
+        log[f'train/loss_tbin_{b}'] = info['tbin_loss']
 
     if log_model_debug:
         for key in ('t_emb_abs_mean', 'y_emb_abs_mean', 'c_abs_mean', 'c_l2_mean',
                      'support_pooled_abs_mean', 'support_pooled_l2_mean'):
             dbg_key = f'dbg/{key}'
             if dbg_key in info:
-                log[dbg_key] = float(np.array(info[dbg_key]).mean())
-                # Rename support_pooled keys for clarity
-                if 'support_pooled' in key:
-                    log[f'dbg/{key}_model'] = log.pop(dbg_key)
+                dest = f'dbg/{key}_model' if 'support_pooled' in key else dbg_key
+                log[dest] = info[dbg_key]
 
         if 'dbg/act_abs_per_layer' in info:
-            act_abs = np.array(info['dbg/act_abs_per_layer']).mean(axis=0)
-            act_rms = np.array(info['dbg/act_rms_per_layer']).mean(axis=0)
-            for li in range(cfg.depth):
-                log[f'act/layer{li}_abs_mean'] = float(act_abs[li])
-                log[f'act/layer{li}_rms'] = float(act_rms[li])
+            log['_act_abs_per_layer'] = info['dbg/act_abs_per_layer']
+            log['_act_rms_per_layer'] = info['dbg/act_rms_per_layer']
+            log['_depth'] = cfg.depth
 
     if sup_pooled_global is not None and class_ids_global is not None:
         cond_metrics, same_vals, diff_vals = compute_condition_distribution_metrics(
             sup_pooled_global, class_ids_global
         )
         log.update(cond_metrics)
-        if step % cond_hist_interval == 0:
+        if step % cond_hist_interval == 0 and wandb is not None:
             log['cond/support_pooled_hist'] = wandb.Histogram(
-                sup_pooled_global.reshape(-1)
+                np.asarray(sup_pooled_global).reshape(-1)
             )
             if same_vals.size:
                 log['cond/same_class_cos_hist'] = wandb.Histogram(same_vals)
             if diff_vals.size:
                 log['cond/diff_class_cos_hist'] = wandb.Histogram(diff_vals)
 
-    wandb.log(log, step=step)
+    _dispatch(log, step, async_logger)
 
 
-def log_perf_metrics(step, data_time, siglip_time, vae_time, step_time,
-                     total_time, data_mode='grain', siglip_stats=None):
-    """Log performance / timing metrics to wandb."""
-    perf_log = {
-        'perf/data_time': data_time,
-        'perf/siglip_encode_time': siglip_time,
-        'perf/vae_time': vae_time,
-        'perf/train_step_time': step_time,
-        'perf/total_iter_time': total_time,
-    }
-    if data_mode == 'online' and siglip_stats is not None:
-        perf_log['perf/siglip_cache_hit_rate'] = float(siglip_stats['cache_hit_rate'])
-        perf_log['perf/siglip_cache_items'] = float(siglip_stats['cache_items'])
-        perf_log['perf/siglip_unique_paths_per_batch'] = float(
-            siglip_stats['unique_paths_per_batch']
-        )
-    wandb.log(perf_log, step=step)
+def _dispatch(log_dict, step, async_logger):
+    """Send log_dict to wandb via async_logger if available, else synchronously."""
+    if async_logger is not None:
+        async_logger.log(log_dict, step)
+    elif wandb is not None:
+        # Synchronous fallback: materialise arrays here
+        materialised = {}
+        for k, v in log_dict.items():
+            if hasattr(v, 'shape'):
+                v = float(np.asarray(v).mean())
+            materialised[k] = v
+        wandb.log(materialised, step=step)
+
 
 
 def log_eval_metrics(step, v_loss_f, v_tbin_f, loss_ema, cfg,
                      val_sup_pooled_global, val_class_ids,
                      data_mode='grain', val_siglip_stats=None,
-                     cond_hist_interval=5000):
+                     cond_hist_interval=5000, async_logger=None):
     """Log evaluation / validation metrics to wandb."""
     gap = (loss_ema[0] - v_loss_f) if loss_ema[0] else 0.0
     log = {'val/loss': v_loss_f, 'val/train_val_gap': gap}
@@ -180,27 +226,19 @@ def log_eval_metrics(step, v_loss_f, v_tbin_f, loss_ema, cfg,
     for k, v in cond_metrics.items():
         log[f'val_{k}'] = v
 
-    if data_mode == 'online' and val_siglip_stats is not None:
-        log['val_perf/siglip_encode_time'] = float(val_siglip_stats['encode_time'])
-        log['val_perf/siglip_cache_hit_rate'] = float(val_siglip_stats['cache_hit_rate'])
-        log['val_perf/siglip_cache_items'] = float(val_siglip_stats['cache_items'])
-        log['val_perf/siglip_unique_paths_per_batch'] = float(
-            val_siglip_stats['unique_paths_per_batch']
-        )
-
-    if step % cond_hist_interval == 0:
+    if step % cond_hist_interval == 0 and wandb is not None:
         log['val_cond/support_pooled_hist'] = wandb.Histogram(
-            val_sup_pooled_global.reshape(-1)
+            np.asarray(val_sup_pooled_global).reshape(-1)
         )
         if same_vals.size:
             log['val_cond/same_class_cos_hist'] = wandb.Histogram(same_vals)
         if diff_vals.size:
             log['val_cond/diff_class_cos_hist'] = wandb.Histogram(diff_vals)
 
-    wandb.log(log, step=step)
+    _dispatch(log, step, async_logger)
 
 
-def log_attn_entropy(step, ent_matrix, cfg):
+def log_attn_entropy(step, ent_matrix, cfg, async_logger=None):
     """Log attention entropy metrics to wandb."""
     ent = np.array(ent_matrix).mean(axis=0)  # avg devices → (depth, H)
     depth = cfg.depth
@@ -209,4 +247,4 @@ def log_attn_entropy(step, ent_matrix, cfg):
         alog[f'attn/entropy_layer{li}'] = float(ent[li].mean())
     for h in range(cfg.num_heads):
         alog[f'attn/entropy_head{h}_last'] = float(ent[-1, h])
-    wandb.log(alog, step=step)
+    _dispatch(alog, step, async_logger)
