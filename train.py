@@ -852,11 +852,7 @@ def main(_):
                 cond_hist_interval=FLAGS.cond_hist_interval,
             )
 
-        if step % FLAGS.perf_log_interval == 0 and jax.process_index() == 0:
-            log_perf_metrics(
-                step, data_time, siglip_time, vae_time, step_time, dt_step,
-                data_mode=FLAGS.data_mode, siglip_stats=siglip_stats,
-            )
+
 
         # ── Eval ──
         if step % FLAGS.eval_interval == 0 or step == 1000:
